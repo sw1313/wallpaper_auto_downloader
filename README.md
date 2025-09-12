@@ -1,6 +1,7 @@
 # wallpaper_auto_downloader
 Wallpaper Engine – Wallpaper Scheduled Automatic Switching Application<br/>
 Automatically download Workshop items via steamcmd and use the WE application to switch wallpapers on a schedule<br/>
+Because Steam prohibits automated programs from logging in without a head, and there is no API for automatically subscribing to the workshop, you can only rely on steamcmd for downloading and cannot subscribe.<br/>
 The config requires the following parameters:<br/>
 api_key (Steam Web API key, obtained from https://steamcommunity.com/dev/apikey)<br/>
 interval (Scheduling interval, e.g., 3h / 90m / 1h30m; leave empty to execute only once)<br/>
@@ -14,6 +15,7 @@ Due to steamcmd being a separate login for Steam, it is not possible to subscrib
 <br/>
 Wallpaper Engine - 壁纸定时自动切换应用程序<br/>
 通过steamcmd自动下载创意工坊文件并让we应用来定时切换壁纸<br/>
+因为steam禁止自动化程序进行无头登录，且也没有自动订阅创意工坊的api，所以只能依靠steamcmd下载，不能订阅<br/>
 config需要输入参数:<br/>
 api_key（steam的web api_key，在https://steamcommunity.com/dev/apikey 获取）<br/>
 interval（定时周期：如 3h / 90m / 1h30m；留空则只执行一次）<br/>
