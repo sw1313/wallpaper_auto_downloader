@@ -1,0 +1,86 @@
+[steam]
+# 可选：Steam Web API Key（没有也能查，留空即可；留空则退回网页抓取，可能受年龄门槛影响）
+api_key=
+
+[subscribe]
+# 订阅方式：此脚本仅实现 steamcmd
+mode=steamcmd
+# 每轮只下载/应用 1 个，下一轮（interval 到时）继续下一个
+one_per_run=true
+# 当一轮轮完所有候选时，是否从头继续轮
+rotate_if_all_done=true
+# 本轮最多尝试多少个候选
+max_attempts_per_run=5
+# 手工指定要“订阅/更新”的作品ID（逗号分隔）；留空则自动用 Web API 按排序/筛选抓热门候选
+# 示例：ids=3558034522,2875436207,2792207988
+ids=
+
+[schedule]
+# 脚本启动时立即执行一次
+run_on_startup=true
+# 周期定时：如 3h / 90m / 1h30m；留空则只执行一次
+interval=2h
+
+[sort]
+# 排序：Top Rated | Most Popular (Today/Week/Month/Year) | Most Recent | Most Subscriptions | Most Up Votes
+method=Most Popular (Week)
+
+[fallback]
+# 当 Web API 不可用时的回退抓取规模（网页抓取）
+pages=8
+page_size=40
+# API 模式下的兜底上限（可按需调大）
+max_pages=60
+
+[filters]
+# Show only: 例如 Approved, Mobile compatible, Audio responsive, Customizable
+show_only=
+# Type: Scene, Video, Web, Application, Wallpaper, Preset（常用 Scene/Video/Web）
+types=Video
+# 年龄分级：G | PG13 | R（会映射为 Everyone / Questionable / Mature）
+age=G,PG13
+# 分辨率：例如 3840 x 2160 或 Ultrawide 3440 x 1440（可留空）
+resolution=
+# 标签（多项逗号分隔）：Abstract,Animal,Anime,Cartoon,CGI,Cyberpunk,Fantasy,Game,Girls,Guys,Landscape,Medieval,Memes,MMD (Miku-Miku Dance),Music,Nature,Pixel art,Relaxing,Retro,Sci-Fi,Sports,Technology,Television,Vehicle,Unspecified genre
+tags=
+# 排除的标签（可空）
+exclude=Abstract,Memes
+# 每次 Web API 拉取的每页数量（优先级高于 [fallback].page_size）
+numperpage=60
+# 过滤后至少要拿到这么多候选（API 模式生效）
+min_candidates=100
+
+[cleanup]
+# 应用新壁纸后，删除“上一张”（会清理 3 处：steamcmd 下载目录 / 官方 workshop 目录 / WE projects\backup）
+delete_previous=true
+# 保留最近 N 张（>0 时，不执行“删除上一张”；仍会维护 history）
+keep_last_n=0
+# 若为 true，则移动到脚本目录的 Trash/ 下（简易“回收”）；false 直接删除
+use_recycle_bin=false
+protected_ids=
+
+[paths]
+# Wallpaper Engine 可执行文件
+we_exe=C:\Program Files (x86)\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe
+workshop_root=J:\WE_script_workshop
+# 指定 steamcmd 路径
+steamcmd=D:\steamcmd\steamcmd.exe
+# 状态文件
+state_file=we_auto_state.json
+
+[network]
+http_proxy=
+https_proxy=
+
+[auth]
+# 你的 Steam 账号；强烈建议至少填账号名，首次可配合 password/guard 进行一次登录
+steam_username=
+# 可选：仅在首次脚本内登录时填写；成功后建议清空并依赖已保存凭证
+steam_password=
+# 可选：两步验证码（或用外部命令先登录一次）
+steam_guard_code=
+
+[logging]
+# 是否在脚本目录生成日志文件，记录下载/应用过的创意工坊地址
+enable=true
+file=we_downloads.log
