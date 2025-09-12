@@ -9,7 +9,7 @@ we_exe (Path to the Wallpaper Engine executable; right-click in Steam → Manage
 workshop_root (Path where WE will store wallpapers; it is recommended not to use the official Workshop path to prevent deletion of subscribed wallpapers)<br/>
 steamcmd (Path to steamcmd; download from https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip)<br/>
 steam_username (The account that has purchased Wallpaper Engine)<br/>
-Before running the program for the first time, unzip steamcmd into a folder, then run `cmd` or `PowerShell` in that path, execute `steamcmd.exe` or `.\steamcmd.exe`, then run `login username password. You will be prompted to enter the mobile authenticator / email verification code. Once logged in successfully, the login information will be recorded in steamcmd<br/>
+Before running the program for the first time, unzip steamcmd into a folder, then run `cmd` or `PowerShell` in that path, execute `steamcmd.exe` or `.\steamcmd.exe`, then run "login username password". You will be prompted to enter the mobile authenticator / email verification code. Once logged in successfully, the login information will be recorded in steamcmd<br/>
 Due to steamcmd being a separate login for Steam, it is not possible to subscribe to Workshop files in Wallpaper Engine while the program is running. If you must subscribe to Workshop files while the program is running, please purchase two copies of Wallpaper Engine with two different accounts and log into Steam and steamcmd with different accounts. Use the account that steamcmd logs in with as "steam_username".<br/>
 <br/>
 Wallpaper Engine - 壁纸定时自动切换应用程序<br/>
