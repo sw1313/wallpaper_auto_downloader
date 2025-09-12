@@ -1,7 +1,6 @@
 # wallpaper_auto_downloader
 Wallpaper Engine – Wallpaper Scheduled Automatic Switching Application<br/>
 Automatically download Workshop items via steamcmd and use the WE application to switch wallpapers on a schedule<br/>
-<br/>
 The config requires the following parameters:<br/>
 api_key (Steam Web API key, obtained from https://steamcommunity.com/dev/apikey)<br/>
 interval (Scheduling interval, e.g., 3h / 90m / 1h30m; leave empty to execute only once)<br/>
