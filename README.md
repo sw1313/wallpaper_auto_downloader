@@ -9,7 +9,7 @@ we_exe (Path to the Wallpaper Engine executable; right-click in Steam → Manage
 workshop_root (Path where WE will store wallpapers; it is recommended not to use the official Workshop path to prevent deletion of subscribed wallpapers)<br/>
 steamcmd (Path to steamcmd; download from https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip)<br/>
 steam_username (The account that has purchased Wallpaper Engine)<br/>
-Before running the program for the first time, unzip steamcmd into a folder, then run `cmd` or `PowerShell` in that path, execute `steamcmd.exe` or `.\steamcmd.exe`, then run `login &lt;username&gt; &lt;password&gt;`. You will be prompted to enter the mobile authenticator / email verification code. Once logged in successfully, the login information will be recorded in steamcmd<br/><br/>
+Before running the program for the first time, unzip steamcmd into a folder, then run `cmd` or `PowerShell` in that path, execute `steamcmd.exe` or `.\steamcmd.exe`, then run `login username password. You will be prompted to enter the mobile authenticator / email verification code. Once logged in successfully, the login information will be recorded in steamcmd<br/><br/>
 Wallpaper Engine - 壁纸定时自动切换应用程序<br/>
 通过steamcmd自动下载创意工坊文件并让we应用来定时切换壁纸<br/>
 config需要输入参数:<br/>
