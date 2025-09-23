@@ -5,12 +5,13 @@ we_tray.py
 右键菜单：打开/隐藏控制台、立即更换（重启一次）、开机自启开关、退出
 
 修复点：Windows 息屏/解锁或 Explorer 重启后，托盘图标丢失。
-做法：后台 TrayKeeper 线程监测 Shell_TrayWnd 句柄变化，自动重建托盘图标。
+做法：后台 TrayKeeper 线程 + TaskbarCreated 消息监听 + 电源恢复 & 会话解锁监听，自动重建托盘图标。
 
 依赖：pip install pystray pillow
 """
 from __future__ import annotations
 import os, sys, threading, subprocess, queue, time, ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
@@ -46,10 +47,8 @@ class SingleInstance:
 # 开机自启（注册表 HKCU\...\Run）
 def _autostart_command() -> str:
     if getattr(sys, "frozen", False):
-        # 打包：直接运行 exe 本体
         return f'"{sys.executable}"'
     else:
-        # 开发：python.exe -u "绝对路径\we_tray.py"
         script = Path(__file__).resolve()
         return f'"{sys.executable}" -u "{script}"'
 
@@ -80,7 +79,6 @@ def _make_icon_image():
     img = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, 15, 15], outline=(0, 0, 0, 255), width=1)
-    # 简洁“WE”
     d.text((2, 1), "W", fill=(0, 0, 0, 255))
     d.text((2, 8), "E", fill=(0, 0, 0, 255))
     return img
@@ -132,7 +130,7 @@ class ConsoleWindow:
             finally:
                 self.root.after(100, poll)
         poll()
-        self.root.withdraw()  # 默认隐藏
+        self.root.withdraw()
         self.root.mainloop()
 
     def append(self, s: str):
@@ -143,7 +141,6 @@ class ConsoleWindow:
         if self.root:
             self.root.deiconify()
             self._visible_flag = True
-            # 首次打开时把历史刷进去
             if self.text and float(self.text.index("end-1c").split(".")[0]) <= 1:
                 self.text.configure(state="normal")
                 self.text.delete("1.0", "end")
@@ -175,7 +172,7 @@ def _win_hidden_popen_kwargs():
     try:
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
+        si.wShowWindow = 0
         return {"startupinfo": si, "creationflags": CREATE_NO_WINDOW}
     except Exception:
         return {"creationflags": CREATE_NO_WINDOW}
@@ -223,71 +220,57 @@ def stop_worker(wp: WorkerProc, timeout=5.0):
     except Exception:
         pass
 
-# ------- 托盘 + 自动重建（修复消失问题） --------------------------
+# ------- 托盘 + 自动重建 --------------------------
 class TrayApp:
     def __init__(self):
         self.console = ConsoleWindow("Wallpaper Engine - 实时控制台")
         self.wp = start_worker_and_reader(self.console)
 
-        self._icon = None           # pystray.Icon
+        self._icon = None
         self._icon_thread = None
         self._lock = threading.RLock()
         self._stop_evt = threading.Event()
         self._keeper_thread = None
         self._last_taskbar = 0
-        self._last_nudge = 0.0
 
-    # 菜单回调
-    def on_toggle_console(self, icon, _):
-        self.console.toggle()
+    def on_toggle_console(self, icon, _): self.console.toggle()
 
     def on_exit(self, icon, _):
         self.console.append("[exit] 正在退出...\n")
         self.stop_icon()
-        try:
-            stop_worker(self.wp, timeout=6)
-        finally:
-            os._exit(0)  # 避免残留线程阻塞
+        try: stop_worker(self.wp, timeout=6)
+        finally: os._exit(0)
 
     def dyn_autostart_text(self, _item):
         return "关闭开机自启" if is_autostart_enabled() else "开启开机自启"
 
     def on_toggle_autostart(self, icon, _):
         cur = is_autostart_enabled()
-        set_autostart(not cur)   # ← 修复：Python 用 not，而不是 !
+        set_autostart(not cur)
         self.console.append(f"[autostart] 已设置开机自启 = {not cur}\n")
-        # 刷新菜单文本
         try:
-            if self._icon:
-                self._icon.update_menu()
-        except Exception:
-            pass
+            if self._icon: self._icon.update_menu()
+        except Exception: pass
 
-    # 新增：立即更换（重启一次 worker 触发新一轮运行）
     def on_force_switch(self, icon, _):
-        self.console.append("[action] 立即更换：正在重启 worker 以立刻执行一轮...\n")
-        try:
-            stop_worker(self.wp, timeout=2.0)
+        self.console.append("[action] 立即更换：正在重启 worker...\n")
+        try: stop_worker(self.wp, timeout=2.0)
         finally:
             self.wp = start_worker_and_reader(self.console)
-            self.console.append("[action] 已重启 worker，新的运行循环已开始。\n")
+            self.console.append("[action] 已重启 worker。\n")
 
-    # 构建 pystray Icon
     def _build_icon(self):
         import pystray
         from pystray import MenuItem as item, Menu
         icon_img = _make_icon_image()
-
         menu = Menu(
             item("打开/隐藏 控制台", self.on_toggle_console, default=True),
             item("立即更换（重启一次）", self.on_force_switch),
             item(self.dyn_autostart_text, self.on_toggle_autostart),
             item("退出", self.on_exit)
         )
-        ic = pystray.Icon("WEAutoTray", icon=icon_img, title="WE Auto Runner", menu=menu)
-        return ic
+        return pystray.Icon("WEAutoTray", icon=icon_img, title="WE Auto Runner", menu=menu)
 
-    # 运行 Icon（单独线程）
     def start_icon(self):
         with self._lock:
             if self._icon_thread and self._icon_thread.is_alive():
@@ -303,14 +286,10 @@ class TrayApp:
     def stop_icon(self):
         with self._lock:
             if self._icon:
-                try:
-                    self._icon.visible = False
-                except Exception:
-                    pass
-                try:
-                    self._icon.stop()
-                except Exception:
-                    pass
+                try: self._icon.visible = False
+                except Exception: pass
+                try: self._icon.stop()
+                except Exception: pass
                 self._icon = None
             if self._icon_thread:
                 self._icon_thread.join(timeout=2.0)
@@ -318,37 +297,20 @@ class TrayApp:
             self.console.append("[tray] 托盘图标已停止。\n")
 
     def rebuild_icon(self):
-        self.console.append("[tray] 检测到任务栏变化，重建托盘图标...\n")
+        self.console.append("[tray] 重建托盘图标...\n")
         self.stop_icon()
-        time.sleep(0.2)  # 稍等任务栏就绪
+        time.sleep(0.2)
         self.start_icon()
 
-    # 守护线程：监测任务栏句柄
     def _keeper_loop(self):
         self._last_taskbar = _get_taskbar_hwnd()
-        # 初始确保图标已在
         self.start_icon()
         while not self._stop_evt.is_set():
             try:
                 h = _get_taskbar_hwnd()
-                if h != 0:
-                    # 句柄恢复或改变 -> 重建图标
-                    if (self._last_taskbar == 0) or (h != self._last_taskbar):
-                        if self._last_taskbar != 0:
-                            self.rebuild_icon()
-                        else:
-                            self.start_icon()
-                # 轻触发：句柄可能没变但图标丢失，定期触发可见性
-                now = time.time()
-                if self._last_nudge + 60 <= now:
-                    with self._lock:
-                        if self._icon:
-                            try:
-                                self._icon.visible = True
-                            except Exception:
-                                self.rebuild_icon()
-                    self._last_nudge = now
-
+                # 任务栏句柄发生变化（Explorer 重启）时重建
+                if h != 0 and h != self._last_taskbar:
+                    self.rebuild_icon()
                 self._last_taskbar = h
             except Exception as e:
                 self.console.append(f"[tray] keeper 异常：{e}\n")
@@ -356,49 +318,118 @@ class TrayApp:
                 self._stop_evt.wait(KEEPER_POLL_SECONDS)
 
     def start(self):
-        # 启动守护线程 + 控制台缓冲
         self.console.start()
         self._keeper_thread = threading.Thread(target=self._keeper_loop, daemon=True)
         self._keeper_thread.start()
         self.console.append("[tray] 守护线程已启动。\n")
-
-        # 主线程 idle：防止进程退出
+        TaskbarWatcher(self).start()
         try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            self.on_exit(None, None)
+            while True: time.sleep(3600)
+        except KeyboardInterrupt: self.on_exit(None, None)
+
+# ------- TaskbarCreated / 电源恢复 / 会话解锁 监听 --------------------------
+class TaskbarWatcher(threading.Thread):
+    def __init__(self, app: TrayApp):
+        super().__init__(daemon=True)
+        self.app = app
+        self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
+        self.wtsapi32 = ctypes.windll.wtsapi32
+
+        # 常量（Windows SDK）
+        self.WM_POWERBROADCAST = 0x0218
+        self.PBT_APMRESUMEAUTOMATIC = 0x0012
+        self.PBT_APMRESUMESUSPEND  = 0x0007
+        self.WM_WTSSESSION_CHANGE  = 0x02B1
+        self.WTS_SESSION_LOGON     = 0x0005
+        self.WTS_SESSION_UNLOCK    = 0x0008
+        self.NOTIFY_FOR_THIS_SESSION = 0  # WTSRegisterSessionNotification flag
+
+    def run(self):
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p)
+
+        def py_wnd_proc(hwnd, msg, wparam, lparam):
+            # Explorer 重启 / 任务栏重建
+            if msg == self._taskbar_created:
+                self.app.console.append("[tray] 收到 TaskbarCreated，重建图标。\n")
+                self._schedule_rebuild()
+            # 睡眠恢复（电源广播）
+            elif msg == self.WM_POWERBROADCAST and wparam in (self.PBT_APMRESUMEAUTOMATIC, self.PBT_APMRESUMESUSPEND):
+                self.app.console.append("[tray] 电源恢复，重建托盘图标。\n")
+                self._schedule_rebuild()
+            # 会话解锁 / 登录（需要注册 WTS 通知）
+            elif msg == self.WM_WTSSESSION_CHANGE and wparam in (self.WTS_SESSION_UNLOCK, self.WTS_SESSION_LOGON):
+                self.app.console.append("[tray] 会话解锁/登录，重建托盘图标。\n")
+                self._schedule_rebuild()
+            return self.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        hinst = self.kernel32.GetModuleHandleW(None)
+        class_name = "WEAutoTrayHiddenWindow"
+
+        # 结构体
+        WNDCLASS = wintypes.WNDCLASS
+        wc = WNDCLASS()
+        wc.lpszClassName = class_name
+        wc.lpfnWndProc = WNDPROC(py_wnd_proc)
+        wc.hInstance = hinst
+
+        if not self.user32.RegisterClassW(ctypes.byref(wc)):
+            return
+
+        # 先注册 TaskbarCreated，避免先建窗后注册导致的竞态
+        self._taskbar_created = self.user32.RegisterWindowMessageW("TaskbarCreated")
+
+        hwnd = self.user32.CreateWindowExW(
+            0, class_name, "hidden", 0, 0, 0, 0, 0,
+            None, None, hinst, None
+        )
+
+        # 订阅会话切换事件（才能收到 WM_WTSSESSION_CHANGE）
+        try:
+            self.wtsapi32.WTSRegisterSessionNotification(hwnd, self.NOTIFY_FOR_THIS_SESSION)
+        except Exception:
+            pass
+
+        msg = wintypes.MSG()
+        while self.user32.GetMessageW(ctypes.byref(msg), hwnd, 0, 0) != 0:
+            self.user32.TranslateMessage(ctypes.byref(msg))
+            self.user32.DispatchMessageW(ctypes.byref(msg))
+
+        # （正常不会走到这）回收
+        try:
+            self.wtsapi32.WTSUnRegisterSessionNotification(hwnd)
+        except Exception:
+            pass
+
+    def _schedule_rebuild(self):
+        """避免在窗口过程里直接动 pystray，放到独立线程里稍微延后执行"""
+        def _do():
+            try:
+                time.sleep(0.3)
+            except Exception:
+                pass
+            self.app.rebuild_icon()
+        threading.Thread(target=_do, daemon=True).start()
 
 # ---------------- 程序入口 ----------------
 def run_worker_inline():
-    """打包后本 exe --worker 模式"""
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except Exception:
-        pass
+    try: sys.stdout.reconfigure(line_buffering=True)
+    except Exception: pass
     base = Path(sys.argv[0]).resolve().parent
     sys.path.insert(0, str(base))
-    try:
-        import we_auto_fetch
+    try: import we_auto_fetch
     except Exception as e:
-        print("[fatal] 无法导入 we_auto_fetch.py：", e)
-        sys.exit(1)
-    try:
-        we_auto_fetch.main()
-    except KeyboardInterrupt:
-        print("\n[worker] 收到中断，退出。")
-    except Exception as e:
-        print("[worker] 未捕获异常：", e)
-        time.sleep(0.5)
+        print("[fatal] 无法导入 we_auto_fetch.py：", e); sys.exit(1)
+    try: we_auto_fetch.main()
+    except KeyboardInterrupt: print("\n[worker] 收到中断，退出。")
+    except Exception as e: print("[worker] 未捕获异常：", e); time.sleep(0.5)
 
 def main():
     if "--worker" in sys.argv:
         run_worker_inline()
     else:
         si = SingleInstance("WEAutoTrayMutex")
-        if si.already_running:
-            # 已在运行：可选唤起已有实例，这里简单退出
-            return
+        if si.already_running: return
         app = TrayApp()
         app.start()
 
