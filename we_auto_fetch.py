@@ -149,6 +149,92 @@ def find_all_workshop_roots() -> List[Path]:
             uniq.append(r); seen.add(r)
     return uniq
 
+# ---------- 路径探测（定时检测 / 驱动器就绪判断） ----------
+def _drive_ready(p: Path) -> bool:
+    """Windows: 判断盘符是否就绪（适配 iSCSI/网络盘）；非 Windows 恒为 True。"""
+    try:
+        if os.name != "nt":
+            return True
+        d = p.drive  # e.g. 'X:'
+        return (not d) or Path(d + "\\").exists()
+    except Exception:
+        return False
+
+def _path_ready(p: Path) -> bool:
+    return _drive_ready(p) and p.exists()
+
+def _candidate_we_exes_from_cfg(cfg: configparser.ConfigParser) -> List[Path]:
+    raw = expand(cfg.get("paths","we_exe",fallback="")).strip()
+    if not raw:
+        return []
+    p = Path(raw)
+    cands = []
+    # 允许用户填“目录”或“具体 exe”
+    if p.suffix.lower() == ".exe":
+        cands.append(p)
+    else:
+        cands += [p / "wallpaper64.exe", p / "wallpaper32.exe", p / "wallpaper_engine.exe"]
+    return cands
+
+def _candidate_we_exes_from_system() -> List[Path]:
+    cands: List[Path] = []
+    # 1) Steam 注册表 → 默认安装目录
+    try:
+        import winreg
+        sp = _reg_str(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath")
+        if sp:
+            base = Path(sp) / "steamapps" / "common" / "wallpaper_engine"
+            cands += [base / "wallpaper64.exe", base / "wallpaper32.exe", base / "wallpaper_engine.exe"]
+    except Exception:
+        pass
+    # 2) 常见 Program Files 路径（以防 Steam 装在默认位置）
+    for env in ("%ProgramFiles(x86)%", "%ProgramFiles%"):
+        base = Path(expand(env)) / "Steam" / "steamapps" / "common" / "wallpaper_engine"
+        cands += [base / "wallpaper64.exe", base / "wallpaper32.exe", base / "wallpaper_engine.exe"]
+    return cands
+
+def locate_we_exe(cfg: configparser.ConfigParser) -> Optional[Path]:
+    """
+    每次调用都尝试发现可用的 WE 可执行文件；
+    找不到则返回 None（由调用方决定“稍后重试”）。
+    """
+    seen = set()
+    for cand in _candidate_we_exes_from_cfg(cfg) + _candidate_we_exes_from_system():
+        try:
+            c = cand.resolve()
+        except Exception:
+            c = cand
+        if c in seen:
+            continue
+        seen.add(c)
+        if _path_ready(c):
+            return c
+    return None
+
+def locate_workshop_root(cfg: configparser.ConfigParser) -> Optional[Path]:
+    """
+    返回就绪的 workshop 根目录；配置项为空则尝试自动发现。
+    - 若驱动器未就绪/路径不存在，不创建、不抛异常，返回 None 等待下次。
+    """
+    ws_root_cfg = expand(cfg.get("paths","workshop_root",fallback="")).strip()
+    if ws_root_cfg:
+        p = Path(ws_root_cfg)
+        # 驱动器就绪且路径已存在则用；未存在但驱动器就绪则创建；驱动器未就绪则返回 None。
+        if not _drive_ready(p):
+            return None
+        if not p.exists():
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return None
+        return p.resolve()
+    # 未配置：从 Steam 库自动发现（每轮执行，适配后挂载的库）
+    roots = find_all_workshop_roots()
+    for r in roots:
+        if _path_ready(r):
+            return r
+    return None
+
 # ---------- HTTP ----------
 def _make_session(https_proxy: str=""):
     try:
@@ -815,16 +901,18 @@ def run_once(cfg: configparser.ConfigParser) -> None:
     if not steamcmd_path: raise RuntimeError("请在 [paths] steamcmd= 指定 steamcmd.exe")
     steamcmd_exe = Path(steamcmd_path)
     if not steamcmd_exe.exists(): raise RuntimeError(f"未找到 steamcmd：{steamcmd_exe}")
-    we_exe = Path(expand(cfg.get("paths","we_exe",fallback="")).strip())
-    if not we_exe.exists(): raise RuntimeError(f"未找到 Wallpaper Engine：{we_exe}")
 
-    ws_root_cfg = expand(cfg.get("paths","workshop_root",fallback="")).strip()
-    if ws_root_cfg:
-        official_root = Path(ws_root_cfg); official_root.mkdir(parents=True, exist_ok=True)
-    else:
-        roots = find_all_workshop_roots()
-        if not roots: raise RuntimeError("未发现 Workshop 目录；请在 [paths] workshop_root= 指定或先启动一次 Steam")
-        official_root = roots[0]
+    # ★ 改为“每轮定时检测” WE 路径
+    we_exe = locate_we_exe(cfg)
+    if not we_exe:
+        print("[wait] 未检测到 Wallpaper Engine 可执行文件（可能磁盘未就绪/ISCSI 未挂载）。将于下个周期重试。")
+        return
+
+    # ★ 改为“每轮定时检测” Workshop 根目录
+    official_root = locate_workshop_root(cfg)
+    if not official_root:
+        print("[wait] 未发现已就绪的 Workshop 目录（可能 Steam 库所在磁盘未挂载）。将于下个周期重试。")
+        return
     print("[workshop] official root:", official_root)
 
     # 候选（ids 优先，否则自动）
