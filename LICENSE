@@ -6,11 +6,20 @@ Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+copies of the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following conditions:
 
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
+
+---
+
+附加声明（Icon 资源）：
+
+本项目使用的图标来自 Streamline Icons — Material Symbols Sharp Line  
+图标版权归原作者所有，遵循 Apache License 2.0。  
+详情请见：https://www.streamlinehq.com/icons/material-symbols-sharp-line  
+Apache License 2.0 链接：https://www.apache.org/licenses/LICENSE-2.0
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
