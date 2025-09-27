@@ -20,6 +20,8 @@ ids=
 run_on_startup=true
 # 周期定时：如 3h / 90m / 1h30m；留空则只执行一次
 interval=2h
+# 路径检测的固定周期
+detect_interval=5m
 
 [sort]
 # 排序：Top Rated | Most Popular (Today/Week/Month/Year) | Most Recent | Most Subscriptions | Most Up Votes

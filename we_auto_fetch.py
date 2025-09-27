@@ -5,6 +5,16 @@ we_auto_fetch.py — Web API(steam api_key) 拉已排序/筛选列表 → 每轮
 → one_per_run 清理（不重写日志，长期去重）
 
 依赖：pip install requests
+
+变更要点（本版）：
+- 路径检测周期固定为 detect_interval（默认 5 分钟），不再参考 interval。
+- run_once() 返回状态字符串，主循环据此选择 sleep 间隔：
+  - WAIT_WE / WAIT_WS → 按 detect_interval 轮询
+  - 其它状态（DONE/NO_CANDIDATES/ERROR）→ 按 interval（若 interval<=0，则仅在检测阶段循环，完成一轮后退出）
+配置示例（可选）：
+[schedule]
+interval=1h
+detect_interval=5m
 """
 
 from __future__ import annotations
@@ -895,7 +905,7 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
     return filtered
 
 # ---------- 主执行（支持 skip 连续换下一个） ----------
-def run_once(cfg: configparser.ConfigParser) -> None:
+def run_once(cfg: configparser.ConfigParser) -> str:
     # 路径
     steamcmd_path = expand(cfg.get("paths","steamcmd",fallback=""))
     if not steamcmd_path: raise RuntimeError("请在 [paths] steamcmd= 指定 steamcmd.exe")
@@ -906,13 +916,13 @@ def run_once(cfg: configparser.ConfigParser) -> None:
     we_exe = locate_we_exe(cfg)
     if not we_exe:
         print("[wait] 未检测到 Wallpaper Engine 可执行文件（可能磁盘未就绪/ISCSI 未挂载）。将于下个周期重试。")
-        return
+        return "WAIT_WE"
 
     # ★ 改为“每轮定时检测” Workshop 根目录
     official_root = locate_workshop_root(cfg)
     if not official_root:
         print("[wait] 未发现已就绪的 Workshop 目录（可能 Steam 库所在磁盘未挂载）。将于下个周期重试。")
-        return
+        return "WAIT_WS"
     print("[workshop] official root:", official_root)
 
     # 候选（ids 优先，否则自动）
@@ -925,7 +935,7 @@ def run_once(cfg: configparser.ConfigParser) -> None:
 
     if not ids_all:
         print("[pick] 无候选；请放宽 [filters] 或在 [subscribe] 填 ids。")
-        return
+        return "NO_CANDIDATES"
 
     # 状态
     state_file = HERE / cfg.get("paths","state_file",fallback="we_auto_state.json")
@@ -957,7 +967,7 @@ def run_once(cfg: configparser.ConfigParser) -> None:
         else:
             print("[pick] 所有候选已轮完；等待下次刷新。")
             save_state(state_file, state)
-            return
+            return "DONE"
 
     if one_per_run:
         attempt_ids: List[int] = []
@@ -1087,6 +1097,7 @@ def run_once(cfg: configparser.ConfigParser) -> None:
 
     save_state(state_file, state)
     print("[done] 本轮完成。")
+    return "DONE"
 
 def main():
     cfg = read_conf()
@@ -1095,17 +1106,39 @@ def main():
         print(f"[exit] [subscribe].mode={mode}；本脚本仅实现 steamcmd 模式。"); return
     run_on_start = _cfg_bool(cfg, "schedule", "run_on_startup", True)
     interval_s = parse_interval(cfg.get("schedule","interval",fallback=""))
+    # 固定检测周期（默认 5 分钟）；可在 [schedule] detect_interval=5m 覆盖
+    detect_s = parse_interval(cfg.get("schedule","detect_interval", fallback="5m"))
+    if detect_s <= 0: detect_s = 300
+
+    status = "INIT"
     if run_on_start:
-        try: run_once(cfg)
-        except Exception as e: print("[error/startup]", e)
-    if interval_s <= 0: return
+        try:
+            status = run_once(cfg)
+        except Exception as e:
+            print("[error/startup]", e)
+            status = "ERROR"
+
+    # 若未设置 interval（<=0），但处于等待路径就绪，则仍按固定检测周期轮询
+    if interval_s <= 0:
+        while isinstance(status, str) and status.startswith("WAIT_"):
+            try:
+                time.sleep(detect_s)
+                status = run_once(cfg)
+            except KeyboardInterrupt:
+                print("\n[exit] 用户中断"); break
+            except Exception as e:
+                print("[error/loop]", e); status = "ERROR"
+        return
+
     while True:
         try:
-            time.sleep(interval_s); run_once(cfg)
+            sleep_for = detect_s if (isinstance(status, str) and status.startswith("WAIT_")) else interval_s
+            time.sleep(sleep_for)
+            status = run_once(cfg)
         except KeyboardInterrupt:
             print("\n[exit] 用户中断"); break
         except Exception as e:
-            print("[error/loop]", e)
+            print("[error/loop]", e); status = "ERROR"
 
 if __name__ == "__main__":
     main()
