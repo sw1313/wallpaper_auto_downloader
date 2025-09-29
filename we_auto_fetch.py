@@ -11,6 +11,9 @@ we_auto_fetch.py — Web API(steam api_key) 拉已排序/筛选列表 → 每轮
 - run_once() 返回状态字符串，主循环据此选择 sleep 间隔：
   - WAIT_WE / WAIT_WS → 按 detect_interval 轮询
   - 其它状态（DONE/NO_CANDIDATES/ERROR）→ 按 interval（若 interval<=0，则仅在检测阶段循环，完成一轮后退出）
+- iSCSI/网络盘修复：
+  - 自动发现到的 Steam 库如果盘符已就绪但 `steamapps\workshop\content\431960` 尚不存在，则**自动创建**该目录。
+  - 强制应用壁纸时增加**重试**，解决刚挂载完的“设备尚未就绪”。
 配置示例（可选）：
 [schedule]
 interval=1h
@@ -127,7 +130,42 @@ def _reg_str(root, subkey, name) -> Optional[str]:
     except Exception:
         return None
 
+def _drive_ready(p: Path) -> bool:
+    """Windows: 判断盘符是否就绪（适配 iSCSI/网络盘）；非 Windows 恒为 True。"""
+    try:
+        if os.name != "nt":
+            return True
+        d = p.drive  # e.g. 'X:'
+        return (not d) or Path(d + "\\").exists()
+    except Exception:
+        return False
+
+def _path_ready(p: Path) -> bool:
+    return _drive_ready(p) and p.exists()
+
+def _ensure_dir_ready(p: Path) -> Optional[Path]:
+    """
+    若盘符就绪但目录不存在，尝试创建；成功则返回绝对路径，失败/未就绪返回 None。
+    用于自动发现的 Workshop 根目录（修复 iSCSI 场景）。
+    """
+    if not _drive_ready(p):
+        return None
+    try:
+        if not p.exists():
+            p.mkdir(parents=True, exist_ok=True)
+        return p.resolve()
+    except Exception:
+        try:
+            # 某些“设备尚未就绪”会短暂失败；若瞬时变为存在，也算通过
+            return p.resolve() if p.exists() else None
+        except Exception:
+            return None
+
 def find_all_workshop_roots() -> List[Path]:
+    """
+    改进点：对于自动发现到的库，如果盘符已就绪但目标目录不存在，直接创建。
+    这样 iSCSI/网络盘挂载后无需等待 Steam 自己创建目录。
+    """
     roots: List[Path] = []
     try:
         import winreg
@@ -142,36 +180,24 @@ def find_all_workshop_roots() -> List[Path]:
                     libs.append(Path(m.group(1)))
             for lib in libs:
                 p = lib / "steamapps" / "workshop" / "content" / str(APPID_WE)
-                if p.exists():
-                    roots.append(p.resolve())
+                rp = _ensure_dir_ready(p)  # ← 关键：就绪则创建
+                if rp:
+                    roots.append(rp)
     except Exception:
         pass
+
     for cand in [r"%ProgramFiles(x86)%\Steam\steamapps\workshop\content\431960",
                  r"%ProgramFiles%\Steam\steamapps\workshop\content\431960"]:
         p = Path(expand(cand))
-        if p.exists():
-            rp = p.resolve()
-            if rp not in roots:
-                roots.append(rp)
+        rp = _ensure_dir_ready(p)  # 同样尝试创建
+        if rp and rp not in roots:
+            roots.append(rp)
+
     uniq, seen = [], set()
     for r in roots:
         if r not in seen:
             uniq.append(r); seen.add(r)
     return uniq
-
-# ---------- 路径探测（定时检测 / 驱动器就绪判断） ----------
-def _drive_ready(p: Path) -> bool:
-    """Windows: 判断盘符是否就绪（适配 iSCSI/网络盘）；非 Windows 恒为 True。"""
-    try:
-        if os.name != "nt":
-            return True
-        d = p.drive  # e.g. 'X:'
-        return (not d) or Path(d + "\\").exists()
-    except Exception:
-        return False
-
-def _path_ready(p: Path) -> bool:
-    return _drive_ready(p) and p.exists()
 
 def _candidate_we_exes_from_cfg(cfg: configparser.ConfigParser) -> List[Path]:
     raw = expand(cfg.get("paths","we_exe",fallback="")).strip()
@@ -225,6 +251,7 @@ def locate_workshop_root(cfg: configparser.ConfigParser) -> Optional[Path]:
     """
     返回就绪的 workshop 根目录；配置项为空则尝试自动发现。
     - 若驱动器未就绪/路径不存在，不创建、不抛异常，返回 None 等待下次。
+    - 自动发现：若盘符就绪但路径不存在，**会主动创建**（iSCSI 修复核心）。
     """
     ws_root_cfg = expand(cfg.get("paths","workshop_root",fallback="")).strip()
     if ws_root_cfg:
@@ -235,6 +262,7 @@ def locate_workshop_root(cfg: configparser.ConfigParser) -> Optional[Path]:
         if not p.exists():
             try:
                 p.mkdir(parents=True, exist_ok=True)
+                print(f"[workshop] 已创建配置指定的根目录：{p}")
             except Exception:
                 return None
         return p.resolve()
@@ -675,8 +703,25 @@ def find_entry(work_dir: Path) -> Optional[Path]:
     vids = list(work_dir.rglob("*.mp4")) or list(work_dir.rglob("*.webm"))
     return vids[0] if vids else None
 
-def apply_in_we(entry: Path, we_exe: Path) -> None:
-    subprocess.run([str(we_exe), "-control", "openWallpaper", "-file", str(entry)], check=True)
+def apply_in_we(entry: Path, we_exe: Path, retries: int = 3, delay_s: float = 1.5) -> None:
+    """
+    iSCSI 修复：初次挂载后可能短暂“设备未就绪”，这里做轻量重试。
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            subprocess.run([str(we_exe), "-control", "openWallpaper", "-file", str(entry)], check=True)
+            return
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            print(f"[apply/retry] 第 {attempt} 次失败，将在 {delay_s}s 后重试：{e}")
+            time.sleep(delay_s)
+        except Exception as e:
+            last_err = e
+            print(f"[apply/retry] 第 {attempt} 次异常，将在 {delay_s}s 后重试：{e}")
+            time.sleep(delay_s)
+    # 最终失败
+    raise last_err if last_err else RuntimeError("apply_in_we: 未知错误")
 
 def mirror_to_projects_backup(we_exe: Path, src_item_dir: Path, wid: int) -> Optional[Path]:
     we_dir = we_exe.parent
@@ -918,10 +963,10 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         print("[wait] 未检测到 Wallpaper Engine 可执行文件（可能磁盘未就绪/ISCSI 未挂载）。将于下个周期重试。")
         return "WAIT_WE"
 
-    # ★ 改为“每轮定时检测” Workshop 根目录
+    # ★ 改为“每轮定时检测” Workshop 根目录（自动创建）
     official_root = locate_workshop_root(cfg)
     if not official_root:
-        print("[wait] 未发现已就绪的 Workshop 目录（可能 Steam 库所在磁盘未挂载）。将于下个周期重试。")
+        print("[wait] 未发现已就绪的 Workshop 目录（可能 Steam 库所在磁盘未挂载或目录尚未创建）。将于下个周期重试。")
         return "WAIT_WS"
     print("[workshop] official root:", official_root)
 
@@ -1036,7 +1081,7 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         proj_dst = mirror_to_projects_backup(we_exe, dst, wid)
         if proj_dst: print(f"[integrate] mirrored to projects/backup: {proj_dst}")
 
-        # 强制应用
+        # 强制应用（带重试）
         entry = find_entry(dst) or find_entry(src)
         if not entry:
             print(f"[warn] 未找到可应用入口文件（project.json/index.html/视频），跳过 {wid}")
@@ -1069,6 +1114,10 @@ def run_once(cfg: configparser.ConfigParser) -> str:
 
         except subprocess.CalledProcessError as e:
             print("[warn] 应用失败：", e)
+            state.setdefault("failed_recent", []).append(wid)
+            applied = False
+        except Exception as e:
+            print("[warn] 应用异常：", e)
             state.setdefault("failed_recent", []).append(wid)
             applied = False
 
