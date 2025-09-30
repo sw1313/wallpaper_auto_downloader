@@ -5,19 +5,6 @@ we_auto_fetch.py — Web API(steam api_key) 拉已排序/筛选列表 → 每轮
 → one_per_run 清理（不重写日志，长期去重）
 
 依赖：pip install requests
-
-变更要点（本版）：
-- 路径检测周期固定为 detect_interval（默认 5 分钟），不再参考 interval。
-- run_once() 返回状态字符串，主循环据此选择 sleep 间隔：
-  - WAIT_WE / WAIT_WS → 按 detect_interval 轮询
-  - 其它状态（DONE/NO_CANDIDATES/ERROR）→ 按 interval（若 interval<=0，则仅在检测阶段循环，完成一轮后退出）
-- iSCSI/网络盘修复：
-  - 自动发现到的 Steam 库如果盘符已就绪但 `steamapps\workshop\content\431960` 尚不存在，则**自动创建**该目录。
-  - 强制应用壁纸时增加**重试**，解决刚挂载完的“设备尚未就绪”。
-配置示例（可选）：
-[schedule]
-interval=1h
-detect_interval=5m
 """
 
 from __future__ import annotations
@@ -26,8 +13,68 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 APPID_WE = 431960
-HERE = Path(__file__).resolve().parent
-CONF_PATH = HERE / "config"  # 无扩展名
+
+# =========================
+# 修 复 ：配置与路径解析
+# =========================
+def _app_root() -> Path:
+    """
+    - PyInstaller 打包：返回 exe 所在目录
+    - 源码运行：返回当前文件所在目录
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+HERE = _app_root()          # 供日志/状态文件等使用（稳定，不再指向 _MEI 临时目录）
+CONF_PATH = None            # 不再在导入期固定；read_conf() 会动态查找
+
+def _candidate_config_paths() -> list[Path]:
+    """
+    返回按优先级排列的候选配置路径（允许 'config' 或 'config.ini'）
+    优先级：环境变量 → 程序目录 → 当前工作目录 → _MEIPASS（若存在）
+    """
+    names = ("config", "config.ini")
+    out: list[Path] = []
+
+    # 1) 显式环境变量
+    env_p = os.environ.get("WE_CONFIG") or os.environ.get("WE_CONF")
+    if env_p:
+        out.append(Path(env_p))
+
+    # 2) 程序目录（exe 同目录 / 源码当前文件目录）
+    base = _app_root()
+    out += [base / n for n in names]
+
+    # 3) 当前工作目录
+    cwd = Path.cwd()
+    if cwd != base:
+        out += [cwd / n for n in names]
+
+    # 4) PyInstaller 临时目录（如果你把 config 打进包里）
+    mei = getattr(sys, "_MEIPASS", None)
+    if mei:
+        m = Path(mei)
+        out += [m / n for n in names]
+
+    # 去重 + 规范化
+    seen, uniq = set(), []
+    for p in out:
+        rp = p.resolve()
+        if rp not in seen:
+            uniq.append(rp); seen.add(rp)
+    return uniq
+
+def read_conf() -> configparser.ConfigParser:
+    candidates = _candidate_config_paths()
+    for p in candidates:
+        if p.exists():
+            cfg = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",))
+            cfg.read(p, encoding="utf-8")
+            print(f"[config] 使用配置：{p}")
+            return cfg
+    tried = "\n  - " + "\n  - ".join(str(p) for p in candidates)
+    raise RuntimeError("未找到配置文件；已尝试：" + tried)
 
 # ---------- 小工具 ----------
 def expand(p: str) -> str:
@@ -35,13 +82,6 @@ def expand(p: str) -> str:
 
 def parse_csv(s: str) -> List[str]:
     return [x.strip() for x in (s or "").split(",") if x.strip()]
-
-def read_conf() -> configparser.ConfigParser:
-    if not CONF_PATH.exists():
-        raise RuntimeError(f"未找到配置文件：{CONF_PATH}")
-    cfg = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",))
-    cfg.read(CONF_PATH, encoding="utf-8")
-    return cfg
 
 def parse_interval(s: str) -> int:
     if not s: return 0
@@ -156,16 +196,11 @@ def _ensure_dir_ready(p: Path) -> Optional[Path]:
         return p.resolve()
     except Exception:
         try:
-            # 某些“设备尚未就绪”会短暂失败；若瞬时变为存在，也算通过
             return p.resolve() if p.exists() else None
         except Exception:
             return None
 
 def find_all_workshop_roots() -> List[Path]:
-    """
-    改进点：对于自动发现到的库，如果盘符已就绪但目标目录不存在，直接创建。
-    这样 iSCSI/网络盘挂载后无需等待 Steam 自己创建目录。
-    """
     roots: List[Path] = []
     try:
         import winreg
@@ -180,7 +215,7 @@ def find_all_workshop_roots() -> List[Path]:
                     libs.append(Path(m.group(1)))
             for lib in libs:
                 p = lib / "steamapps" / "workshop" / "content" / str(APPID_WE)
-                rp = _ensure_dir_ready(p)  # ← 关键：就绪则创建
+                rp = _ensure_dir_ready(p)
                 if rp:
                     roots.append(rp)
     except Exception:
@@ -189,7 +224,7 @@ def find_all_workshop_roots() -> List[Path]:
     for cand in [r"%ProgramFiles(x86)%\Steam\steamapps\workshop\content\431960",
                  r"%ProgramFiles%\Steam\steamapps\workshop\content\431960"]:
         p = Path(expand(cand))
-        rp = _ensure_dir_ready(p)  # 同样尝试创建
+        rp = _ensure_dir_ready(p)
         if rp and rp not in roots:
             roots.append(rp)
 
@@ -205,7 +240,6 @@ def _candidate_we_exes_from_cfg(cfg: configparser.ConfigParser) -> List[Path]:
         return []
     p = Path(raw)
     cands = []
-    # 允许用户填“目录”或“具体 exe”
     if p.suffix.lower() == ".exe":
         cands.append(p)
     else:
@@ -214,7 +248,6 @@ def _candidate_we_exes_from_cfg(cfg: configparser.ConfigParser) -> List[Path]:
 
 def _candidate_we_exes_from_system() -> List[Path]:
     cands: List[Path] = []
-    # 1) Steam 注册表 → 默认安装目录
     try:
         import winreg
         sp = _reg_str(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath")
@@ -223,17 +256,12 @@ def _candidate_we_exes_from_system() -> List[Path]:
             cands += [base / "wallpaper64.exe", base / "wallpaper32.exe", base / "wallpaper_engine.exe"]
     except Exception:
         pass
-    # 2) 常见 Program Files 路径（以防 Steam 装在默认位置）
     for env in ("%ProgramFiles(x86)%", "%ProgramFiles%"):
         base = Path(expand(env)) / "Steam" / "steamapps" / "common" / "wallpaper_engine"
         cands += [base / "wallpaper64.exe", base / "wallpaper32.exe", base / "wallpaper_engine.exe"]
     return cands
 
 def locate_we_exe(cfg: configparser.ConfigParser) -> Optional[Path]:
-    """
-    每次调用都尝试发现可用的 WE 可执行文件；
-    找不到则返回 None（由调用方决定“稍后重试”）。
-    """
     seen = set()
     for cand in _candidate_we_exes_from_cfg(cfg) + _candidate_we_exes_from_system():
         try:
@@ -248,15 +276,9 @@ def locate_we_exe(cfg: configparser.ConfigParser) -> Optional[Path]:
     return None
 
 def locate_workshop_root(cfg: configparser.ConfigParser) -> Optional[Path]:
-    """
-    返回就绪的 workshop 根目录；配置项为空则尝试自动发现。
-    - 若驱动器未就绪/路径不存在，不创建、不抛异常，返回 None 等待下次。
-    - 自动发现：若盘符就绪但路径不存在，**会主动创建**（iSCSI 修复核心）。
-    """
     ws_root_cfg = expand(cfg.get("paths","workshop_root",fallback="")).strip()
     if ws_root_cfg:
         p = Path(ws_root_cfg)
-        # 驱动器就绪且路径已存在则用；未存在但驱动器就绪则创建；驱动器未就绪则返回 None。
         if not _drive_ready(p):
             return None
         if not p.exists():
@@ -266,7 +288,6 @@ def locate_workshop_root(cfg: configparser.ConfigParser) -> Optional[Path]:
             except Exception:
                 return None
         return p.resolve()
-    # 未配置：从 Steam 库自动发现（每轮执行，适配后挂载的库）
     roots = find_all_workshop_roots()
     for r in roots:
         if _path_ready(r):
