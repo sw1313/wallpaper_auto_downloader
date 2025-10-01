@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
 r"""
-we_auto_fetch.py — Web API(steam api_key) 拉已排序/筛选列表 → 每轮只下 1 个（失败自动换下一个）
-→ steamcmd 下载(实时进度)（隐藏黑窗） → 镜像到官方 Workshop → 复制到 WE projects\backup → 强制应用
-→ one_per_run 清理（不重写日志，长期去重）
+we_auto_fetch.py — Steam Workshop -> Wallpaper Engine 自动拉取/筛选/应用
 
-依赖：pip install requests
-
-改动要点（2025-09-30）：
-- 年龄分级以普通 tags 为主（Everyone / Questionable / Mature），KV 仅兜底
-- types 也是普通 tag（Scene / Video / Web / Application / …）
-- 当 age 或 types 只配置单个值时，推入 WebAPI/HTML 的 requiredtags 做服务端筛选；
-  多选时在客户端用 OR 过滤，避免服务端 AND 筛成 0。
-
-改动要点（2025-10-01）：
-- 新增 RUN_NOW 命名事件：允许托盘/外部唤醒本进程，立刻执行一轮 run_once（不重启 worker）。
-- 新增命令行 --once：读取配置并仅执行一轮 run_once 后退出。
+本版要点（2025-10-01）：
+- [filters] 的 show_only / types / age / resolution / tags：**维度内 OR、维度间 AND**；
+  exclude 则在合集中再减去（同时传给服务端 excludedtags[] 预过滤）。
+- 服务端抓取 = “单 tag 分次抓取并集”，本地再做“维度 AND”过滤；达到 min_candidates 才早停。
+- 分辨率兼容多写法（1280x720 / 1280 × 720 / 1280 x 720），tag 或 KV 都能匹配。
+- RUN_NOW 命名事件（配合托盘“立即更换一次”）、--once 单次执行模式。
+- 控制台会输出：各维度配置、抓取分页摘要、应用时该条目的 Type/Age/Resolution/Genres 等元信息。
 """
 
 from __future__ import annotations
@@ -34,7 +28,6 @@ def _app_root() -> Path:
     return Path(__file__).resolve().parent
 
 HERE = _app_root()
-CONF_PATH = None
 
 def _candidate_config_paths() -> list[Path]:
     names = ("config", "config.ini")
@@ -65,6 +58,7 @@ def read_conf() -> configparser.ConfigParser:
             cfg = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",))
             cfg.read(p, encoding="utf-8")
             print(f"[config] 使用配置：{p}")
+            _print_filters_summary(cfg)
             return cfg
     tried = "\n  - " + "\n  - ".join(str(p) for p in candidates)
     raise RuntimeError("未找到配置文件；已尝试：" + tried)
@@ -277,13 +271,13 @@ def _make_session(https_proxy: str=""):
     if https_proxy:
         s.proxies.update({"https": https_proxy, "http": os.environ.get("http_proxy")})
     s.headers.update({
-        "User-Agent": "we-auto-fetch/steamcmd-webapi-1.7 (+requests)",
+        "User-Agent": "we-auto-fetch/steamcmd-webapi-or-AND-1.1 (+requests)",
         "Accept": "application/json, text/html,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
     return s
 
-# ---------- Web API 映射 & 调用 ----------
+# ---------- Web API 映射 ----------
 def map_sort_to_query(sort_name: str) -> Tuple[int,int]:
     s = (sort_name or "").lower()
     if s == "most recent": return 1, 0
@@ -297,172 +291,277 @@ def map_sort_to_query(sort_name: str) -> Tuple[int,int]:
         return 3, 7
     return 3, 7
 
-# === 年龄映射/提取（以 tags 为主） ===
-_AGE_TAG_TO_CANON = {
-    "everyone": "G",
-    "questionable": "PG13",
-    "mature": "R",
+# ---------- 类型/年龄/分辨率 ----------
+_TYPE_ALIASES = {
+    "video": {"video", "movie", "mp4", "webm"},
+    "scene": {"scene", "scenery"},
+    "web": {"web", "webpage", "html"},
+    "application": {"application", "app"},
+    "wallpaper": {"wallpaper"},
+    "preset": {"preset"},
 }
-_CANON_TO_WORKSHOP_TAG = {
+_TYPE_CANON_TO_TAG = {
+    "video": "Video",
+    "scene": "Scene",
+    "web": "Web",
+    "application": "Application",
+    "wallpaper": "Wallpaper",
+    "preset": "Preset",
+}
+
+_AGE_CANON_TO_TAG = {
     "G": "Everyone",
     "PG13": "Questionable",
     "R": "Mature",
 }
-# 一些 KV 可能写法
-_AGE_NORMALIZE_KV = {
-    "everyone": "G", "g": "G",
-    "questionable": "PG13", "pg13": "PG13", "pg-13": "PG13",
-    "mature": "R", "r": "R", "r18": "R", "adult": "R", "adultonly": "R", "adult only": "R",
-}
 
-def _kv_lookup(item: dict) -> Dict[str, str]:
-    kv = {}
-    for kvp in (item.get("kv_tags") or []):
-        k_raw = kvp.get("key", "")
-        v_raw = kvp.get("value", "")
-        k = (k_raw or "").strip().lower()
-        v = (v_raw or "").strip()
-        if k and (k not in kv):
-            kv[k] = v
-    return kv
+def _normalize_resolution_variants(s: str) -> List[str]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    s_norm = s.replace("×", "x").replace("X", "x").replace("*", "x")
+    m = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", s_norm)
+    if not m:
+        return [s]
+    w, h = m.group(1), m.group(2)
+    return [f"{w} x {h}", f"{w}x{h}", f"{w} × {h}"]
 
-def _extract_normalized_age(item: dict) -> Optional[str]:
-    # 1) 优先：从 tags 取 Everyone/Questionable/Mature
-    for t in (item.get("tags") or []):
-        tag = (t.get("tag") or "").strip().lower()
-        if tag in _AGE_TAG_TO_CANON:
-            return _AGE_TAG_TO_CANON[tag]
-    # 2) 兜底：从 KV 的 Age Rating 相近键取
-    kv = _kv_lookup(item)
-    v = (kv.get("age rating") or kv.get("agerating") or kv.get("age_rating") or "").strip().lower()
-    if not v:
-        # 极少数把 "Age Rating: XXX" 塞入普通标签文本里
-        for t in (item.get("tags") or []):
-            tx = (t.get("tag") or "").strip().lower()
-            if "age rating" in tx:
-                for sep in (":", "-", "—", "–"):
-                    if sep in tx:
-                        v = tx.split(sep, 1)[1].strip().lower()
-                        break
-                if v: break
-    v = v.replace("　", " ").replace("/", " ").strip()
-    if not v: return None
-    return _AGE_NORMALIZE_KV.get(v)
+def _norm_tag(s: str) -> str:
+    return (s or "").lower().replace("×","x").replace("*","x").replace(" ", "").strip()
 
-def _age_single_workshop_tag_from_csv(ages_csv: str) -> Optional[str]:
-    """若 age 仅配置单一等级，则返回对应的 Workshop tag（Everyone/Questionable/Mature）。"""
-    wanted = [x.upper() for x in parse_csv(ages_csv)]
-    uniq = sorted(set(wanted))
-    if len(uniq) != 1:
-        return None
-    return _CANON_TO_WORKSHOP_TAG.get(uniq[0])
+# ---------- 维度构建（维度内 OR、维度间 AND） ----------
+def _build_dimensions(cfg: configparser.ConfigParser):
+    # genres（show_only + tags）
+    genres = parse_csv(cfg.get("filters","show_only",fallback="")) + parse_csv(cfg.get("filters","tags",fallback=""))
+    genres_norm = {_norm_tag(x) for x in genres if x}
 
-def _age_match_any(item: dict, ages_csv: str) -> bool:
-    wanted = {x.upper() for x in parse_csv(ages_csv)}
-    if not wanted:
-        return True  # 未配置 age 不过滤
-    norm = _extract_normalized_age(item)
-    if norm is None:
-        # WE 基本都有年龄 tag；稳妥：不识别则不通过
-        return False
-    return norm in wanted
-# === 结束：年龄映射/提取 ===
+    # types
+    types_in = [t.strip().lower() for t in parse_csv(cfg.get("filters","types",fallback=""))]
+    type_tags = []
+    for t in types_in:
+        if t in _TYPE_CANON_TO_TAG:
+            type_tags.append(_TYPE_CANON_TO_TAG[t])
+        else:
+            hit = False
+            for canon, aliases in _TYPE_ALIASES.items():
+                if t == canon or t in aliases:
+                    type_tags.append(_TYPE_CANON_TO_TAG.get(canon, t.title()))
+                    hit = True
+                    break
+            if not hit:
+                type_tags.append(t.title())
+    types_norm = {_norm_tag(x) for x in type_tags}
 
-def query_files_webapi(cfg: configparser.ConfigParser) -> Tuple[List[int], Dict[int, dict], str]:
+    # age
+    ages_in = [x.strip().upper() for x in parse_csv(cfg.get("filters","age",fallback=""))]
+    age_tags = [_AGE_CANON_TO_TAG[a] for a in ages_in if a in _AGE_CANON_TO_TAG]
+    ages_norm = {_norm_tag(x) for x in age_tags}
+
+    # resolution
+    res_in = parse_csv(cfg.get("filters","resolution",fallback=""))
+    res_sets = []
+    for r in res_in:
+        vars = _normalize_resolution_variants(r)
+        if vars:
+            res_sets.append({_norm_tag(x) for x in vars})
+
+    # exclude
+    exclude_norm = {_norm_tag(x) for x in parse_csv(cfg.get("filters","exclude",fallback=""))}
+
+    return {
+        "genres_norm": genres_norm,
+        "types_norm": types_norm,
+        "ages_norm": ages_norm,
+        "res_sets": res_sets,
+        "exclude_norm": exclude_norm,
+    }
+
+def _print_filters_summary(cfg: configparser.ConfigParser):
+    dims = _build_dimensions(cfg)
+    def fmt(s): return ", ".join(sorted(s)) if s else "(未设)"
+    def fmt_res(rs): return ", ".join(sorted(next(iter(r)) for r in rs)) if rs else "(未设)"
+    print("[filters] 维度（OR-AND 模式）：")
+    print("  - Genres(show_only+tags):", fmt(dims["genres_norm"]))
+    print("  - Types:", fmt(dims["types_norm"]))
+    print("  - Ages:", fmt(dims["ages_norm"]))
+    print("  - Resolutions:", fmt_res(dims["res_sets"]))
+    print("  - Exclude:", fmt(dims["exclude_norm"]))
+
+# ---------- WebAPI：按单 tag 抓取并集 ----------
+def _make_session_for_cfg(cfg):
+    return _make_session(cfg.get("network","https_proxy",fallback="").strip())
+
+def _query_webapi_single_tag(sess, key: str, qtype: int, days: int, npp: int,
+                             req_tag: Optional[str], exc_tags: List[str], cursor: str) -> Tuple[Dict, str]:
+    base_url = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
+    payload = {
+        "query_type": qtype, "appid": APPID_WE, "numperpage": npp,
+        "return_kv_tags": True, "return_tags": True,
+        "return_children": False, "return_previews": False,
+        "match_all_tags": True, "filetype": 0,
+        "mature_content": True, "include_mature": True,
+        "cache_max_age_seconds": 60,
+    }
+    if qtype == 3 and days:
+        payload["days"] = days
+        payload["include_recent_votes_only"] = False
+    if req_tag:
+        payload["requiredtags"] = [req_tag]
+    if exc_tags:
+        payload["excludedtags"] = exc_tags
+    if cursor:
+        payload["cursor"] = cursor
+
+    params = {"key": key, "input_json": json.dumps(payload, separators=(",", ":"))}
+    r = sess.get(base_url, params=params, timeout=(8, 25))
+    if not r.ok:
+        return {}, ""
+    try:
+        resp = r.json().get("response", {}) or {}
+        return resp, resp.get("next_cursor", "")
+    except Exception:
+        return {}, ""
+
+def _include_tags_from_dims_for_queries(cfg) -> Tuple[List[str], List[str]]:
+    d = _build_dimensions(cfg)
+    include_plain = []  # 普通 tag：genres + types + ages
+    include_plain += list({x for x in d["genres_norm"]})
+    include_plain += list({x for x in d["types_norm"]})
+    include_plain += list({x for x in d["ages_norm"]})
+    # 反归一化：把无空格的规范值变回服务端常见写法（仅针对常见内置 tag，我们直接用首字母大写）
+    renorm = {"video":"Video","scene":"Scene","web":"Web","application":"Application","wallpaper":"Wallpaper","preset":"Preset",
+              "everyone":"Everyone","questionable":"Questionable","mature":"Mature"}
+    include_plain = [renorm.get(x, x) for x in include_plain]
+
+    # resolution：使用 'W x H'
+    res_req_tags = []
+    for r in parse_csv(cfg.get("filters","resolution",fallback="")):
+        vars = _normalize_resolution_variants(r)
+        if vars:
+            res_req_tags.append(vars[0])
+    return include_plain, res_req_tags
+
+def query_files_webapi_union_AND(cfg: configparser.ConfigParser) -> Tuple[List[int], Dict[int,dict], str]:
     key = (cfg.get("steam","api_key",fallback="") or "").strip()
     if not key:
         return [], {}, "no_key"
 
-    https_proxy = cfg.get("network","https_proxy",fallback="").strip()
-    sess = _make_session(https_proxy)
-
+    sess = _make_session_for_cfg(cfg)
     sort_name = cfg.get("sort","method",fallback="Most Popular (Week)")
     qtype, days = map_sort_to_query(sort_name)
-    pages = _cfg_int(cfg, "fallback", "pages", 3)
     page_size = _cfg_int(cfg, "filters", "numperpage", _cfg_int(cfg, "fallback", "page_size", 40))
+    pages = _cfg_int(cfg, "fallback", "pages", 3)
+    max_pages = max(pages, _cfg_int(cfg, "fallback", "max_pages", pages))
+    min_cands = _cfg_int(cfg, "filters", "min_candidates", 0)
 
-    req_tags = [t for t in parse_csv(cfg.get("filters","show_only",fallback="")) if t.lower()!="approved"]
-    req_tags += parse_csv(cfg.get("filters","tags",fallback=""))
-    exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
+    dims = _build_dimensions(cfg)
+    include_plain, res_req_tags = _include_tags_from_dims_for_queries(cfg)
+    exc_tags = list({x for x in parse_csv(cfg.get("filters","exclude",fallback=""))})
 
-    # ★ 若 age= 单值，则把对应 Workshop Tag 放入 requiredtags（服务端筛选）
-    age_tag = _age_single_workshop_tag_from_csv(cfg.get("filters","age",fallback=""))
-    if age_tag:
-        req_tags = list(dict.fromkeys(req_tags + [age_tag]))
-    # ★ 若 types= 单值，同理
-    type_tag = _single_type_workshop_tag_from_csv(cfg.get("filters","types",fallback=""))
-    if type_tag:
-        req_tags = list(dict.fromkeys(req_tags + [type_tag]))
+    tags_to_query: List[Optional[str]] = [*include_plain, *res_req_tags] if (include_plain or res_req_tags) else [None]
 
-    base_url = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
     ids: List[int] = []
     det: Dict[int, dict] = {}
-    dbg: List[str] = []
-    if req_tags:
-        dbg.append(f"requiredtags={req_tags!r}")
+    seen_ids = set()
+    dbg_logs: List[str] = []
 
-    cursor = "*"
-    for p in range(1, pages+1):
-        payload = {
-            "query_type": qtype,
-            "appid": APPID_WE,
-            "numperpage": page_size,
-            "return_kv_tags": True,
-            "return_tags": True,
-            "return_children": False,
-            "return_previews": False,
-            "match_all_tags": True,
-            "filetype": 0,
-            "mature_content": True,
-            "include_mature": True,
-            "cache_max_age_seconds": 60,
-        }
-        if qtype == 3 and days:
-            payload["days"] = days
-            payload["include_recent_votes_only"] = False
-        if req_tags:
-            payload["requiredtags"] = req_tags
-        if exc_tags:
-            payload["excludedtags"] = exc_tags
-        if cursor:
-            payload["cursor"] = cursor
-        else:
-            payload["page"] = p
-
-        params = {"key": key, "input_json": json.dumps(payload, separators=(",", ":"))}
-
-        try:
-            r = sess.get(base_url, params=params, timeout=(8, 25))
-            dbg.append(f"p{p}: GET qtype={qtype}, days={days}, npp={page_size} -> HTTP {r.status_code}")
-            if not r.ok:
-                t = (r.text or "")[:200].replace("\n"," ")
-                dbg.append(f"body: {t}")
-                break
-
-            resp = r.json().get("response", {}) or {}
+    for tag in tags_to_query:
+        cursor = "*"
+        for p in range(1, max_pages+1):
+            resp, cursor = _query_webapi_single_tag(sess, key, qtype, days, page_size, tag, exc_tags, cursor)
             items = resp.get("publishedfiledetails") or resp.get("files") or resp.get("items") or []
+            dbg_logs.append(f"[api] tag={tag or '<none>'} p{p} items={len(items)}")
             if not items:
-                dbg.append(f"p{p}: empty items")
                 break
-
             for it in items:
                 fid = int(str(it.get("publishedfileid", "0")))
-                if not fid: continue
-                if fid not in det:
-                    det[fid] = it
-                    ids.append(fid)
+                if not fid or fid in seen_ids: continue
+                seen_ids.add(fid); ids.append(fid)
+                if fid not in det: det[fid] = it
 
-            cursor = resp.get("next_cursor", "")
-            if not cursor or len(items) < page_size:
+            # 仅当“维度 AND”过滤后数量达到 min_candidates 才早停
+            if min_cands > 0:
+                cur = filter_ids_with_details_AND(ids, det, cfg)
+                if len(cur) >= min_cands:
+                    dbg_logs.append(f"[api] early-stop: reached min_candidates={min_cands} with AND filter")
+                    return cur, {i: det[i] for i in cur}, " | ".join(dbg_logs)
+
+            if (not cursor) or (len(items) < page_size):
                 break
 
-        except Exception as e:
-            dbg.append(f"exception: {e!r}")
-            break
+    filtered = filter_ids_with_details_AND(ids, det, cfg)
+    return filtered, {i: det[i] for i in filtered}, " | ".join(dbg_logs)
 
-    return ids, det, " | ".join(dbg)
+# ---------- HTML 回退（并集抓取 + 维度 AND 过滤） ----------
+def map_sort_html(sort_name: str) -> Tuple[str,int]:
+    s = (sort_name or "").lower()
+    if s == "top rated": return "vote", 0
+    if s.startswith("most popular"):
+        if "year" in s:  return "trend", 365
+        if "month" in s: return "trend", 30
+        if "week" in s:  return "trend", 7
+        if "day" in s:   return "trend", 1
+        return "trend", 7
+    if s == "most recent": return "publicationdate", 0
+    if s in ("most subscriptions","most subscribed"): return "totaluniquesubscriptions", 0
+    return "trend", 7
 
-# ---------- HTML 回退（仅当没有 api_key 时） ----------
+def _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, page, req_tag, exc_tags) -> List[int]:
+    headers = {"Referer": f"{base_url}?appid={APPID_WE}&browsesort={comm_sort}"}
+    params = {
+        "appid": str(APPID_WE), "browsesort": comm_sort, "days": str(comm_days or 0),
+        "actualsort": comm_sort, "l": "english", "numperpage": str(per_page), "p": str(page),
+        "section": "readytouseitems",
+    }
+    if req_tag:
+        params["requiredtags[]"] = [req_tag]
+    if exc_tags:
+        params["excludedtags[]"] = exc_tags
+    try:
+        r = sess.get(base_url, params=params, headers=headers, timeout=(6,20))
+        if not r.ok: return []
+        html = r.text or ""
+        out, seen = [], set()
+        for m in re.finditer(r'data-publishedfileid="(\d+)"', html):
+            fid = int(m.group(1))
+            if fid not in seen: seen.add(fid); out.append(fid)
+        for m in re.finditer(r'/filedetails/\?id=(\d+)', html):
+            fid = int(m.group(1))
+            if fid not in seen: seen.add(fid); out.append(fid)
+        return out
+    except Exception:
+        return []
+
+def community_ids_html_union(cfg: configparser.ConfigParser) -> List[int]:
+    sort_name = cfg.get("sort","method",fallback="Most Popular (Week)")
+    comm_sort, comm_days = map_sort_html(sort_name)
+    pages = _cfg_int(cfg, "fallback", "pages", 3)
+    max_pages = max(pages, _cfg_int(cfg, "fallback","max_pages", pages))
+    per_page = _cfg_int(cfg, "filters", "numperpage", _cfg_int(cfg, "fallback", "page_size", 40))
+    min_cands = _cfg_int(cfg, "filters", "min_candidates", 0)
+
+    sess = _make_session_for_cfg(cfg)
+    base_url = "https://steamcommunity.com/workshop/browse/"
+
+    include_plain, res_req_tags = _include_tags_from_dims_for_queries(cfg)
+    exc_tags = list({x for x in parse_csv(cfg.get("filters","exclude",fallback=""))})
+    tags_to_query: List[Optional[str]] = [*include_plain, *res_req_tags] if (include_plain or res_req_tags) else [None]
+
+    ids, seen = [], set()
+    for tag in tags_to_query:
+        for p in range(1, max_pages+1):
+            part = _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, p, tag, exc_tags)
+            print(f"[html] tag={tag or '<none>'} p{p} items={len(part)}")
+            for fid in part:
+                if fid not in seen:
+                    seen.add(fid); ids.append(fid)
+            if min_cands > 0 and len(ids) >= min_cands:  # 这里只能用粗略量；最终还会本地 AND 过滤
+                return ids
+            if len(part) < per_page:
+                break
+    return ids
+
+# ---------- 详情获取 ----------
 def fetch_details(ids: List[int], https_proxy: str="") -> Dict[int, dict]:
     if not ids: return {}
     sess = _make_session(https_proxy)
@@ -484,166 +583,125 @@ def fetch_details(ids: List[int], https_proxy: str="") -> Dict[int, dict]:
             continue
     return out
 
-def map_sort_html(sort_name: str) -> Tuple[str,int]:
-    s = (sort_name or "").lower()
-    if s == "top rated": return "vote", 0
-    if s.startswith("most popular"):
-        if "year" in s:  return "trend", 365
-        if "month" in s: return "trend", 30
-        if "week" in s:  return "trend", 7
-        if "day" in s:   return "trend", 1
-        return "trend", 7
-    if s == "most recent": return "publicationdate", 0
-    if s in ("most subscriptions","most subscribed"): return "totaluniquesubscriptions", 0
-    return "trend", 7
+# ---------- 本地过滤（维度 AND） ----------
+def _kv_lookup(item: dict) -> Dict[str, str]:
+    kv = {}
+    for kvp in (item.get("kv_tags") or []):
+        k_raw = kvp.get("key", "")
+        v_raw = kvp.get("value", "")
+        k = (k_raw or "").strip().lower()
+        v = (v_raw or "").strip()
+        if k and (k not in kv):
+            kv[k] = v
+    return kv
 
-def community_ids_html(sort_name: str, pages: int, per_page: int,
-                       https_proxy: str = "", ages_csv: str = "", types_csv: str = "") -> List[int]:
-    sess = _make_session(https_proxy)
-    comm_sort, comm_days = map_sort_html(sort_name)
-    out: List[int] = []; seen = set()
-    base_url = "https://steamcommunity.com/workshop/browse/"
-    headers = {"Referer": f"{base_url}?appid={APPID_WE}&browsesort={comm_sort}"}
-    # requiredtags[] 支持多个值（服务端 AND）
-    age_tag = _age_single_workshop_tag_from_csv(ages_csv)
-    type_tag = _single_type_workshop_tag_from_csv(types_csv)
-    required = []
-    if age_tag:  required.append(age_tag)
-    if type_tag: required.append(type_tag)
+def _extract_age_tag(item: dict) -> Optional[str]:
+    for t in (item.get("tags") or []):
+        tag = (t.get("tag") or "").strip().lower()
+        if tag in ("everyone","questionable","mature"):
+            return tag.title()
+    kv = _kv_lookup(item)
+    v = (kv.get("age rating") or kv.get("agerating") or kv.get("age_rating") or "").strip().lower()
+    if v in ("everyone","questionable","mature"):
+        return v.title()
+    return None
 
-    for p in range(1, pages+1):
-        params = {
-            "appid": str(APPID_WE), "browsesort": comm_sort, "days": str(comm_days or 0),
-            "actualsort": comm_sort, "l": "english", "numperpage": str(per_page), "p": str(p),
-        }
-        if required:
-            params["requiredtags[]"] = required
-        try:
-            r = sess.get(base_url, params=params, headers=headers, timeout=(6,20))
-            if not r.ok: continue
-            html = r.text or ""
-            for m in re.finditer(r'data-publishedfileid="(\d+)"', html):
-                fid = int(m.group(1))
-                if fid not in seen: seen.add(fid); out.append(fid)
-            for m in re.finditer(r'/filedetails/\?id=(\d+)', html):
-                fid = int(m.group(1))
-                if fid not in seen: seen.add(fid); out.append(fid)
-        except Exception:
-            continue
+def _extract_type_tags(item: dict) -> List[str]:
+    out = []
+    lows = {(t.get("tag") or "").strip().lower() for t in (item.get("tags") or [])}
+    for k,v in _TYPE_CANON_TO_TAG.items():
+        if v.lower() in lows:
+            out.append(v)
     return out
 
-# ---------- 过滤 ----------
-_TYPE_ALIASES = {
-    "video": {"video", "movie", "mp4", "webm"},
-    "scene": {"scene", "scenery"},
-    "web": {"web", "webpage", "html"},
-    "application": {"application", "app"},
-    "wallpaper": {"wallpaper"},
-    "preset": {"preset"},
-}
+def _extract_resolution_strings(item: dict) -> List[str]:
+    res = []
+    kv = _kv_lookup(item)
+    kv_val = (kv.get("resolution","") or "").strip()
+    if kv_val:
+        res += _normalize_resolution_variants(kv_val)
+    for t in (item.get("tags") or []):
+        s = (t.get("tag") or "").strip()
+        if re.match(r"^\d+\s*(?:x|×)\s*\d+$", s.replace("X","x")):
+            res += _normalize_resolution_variants(s)
+    # 去重
+    normed = set()
+    out = []
+    for x in res:
+        n = _norm_tag(x)
+        if n not in normed:
+            normed.add(n); out.append(x)
+    return out
 
-# 单一类型 → Workshop tag（供服务端 requiredtags 使用）
-_TYPE_CANON_TO_TAG = {
-    "video": "Video",
-    "scene": "Scene",
-    "web": "Web",
-    "application": "Application",
-    "wallpaper": "Wallpaper",
-    "preset": "Preset",
-}
-def _single_type_workshop_tag_from_csv(types_csv: str) -> Optional[str]:
-    """
-    如果 [filters].types 只配置了一个值，则返回对应的 Workshop tag 字符串（如 "Scene"）。
-    多个值返回 None（因为服务端 requiredtags 是 AND 逻辑，不适合多选 OR）。
-    """
-    vals = [t.strip().lower() for t in parse_csv(types_csv)]
-    uniq = sorted(set(vals))
-    if len(uniq) != 1:
-        return None
-    t = uniq[0]
-    if t in _TYPE_CANON_TO_TAG:
-        return _TYPE_CANON_TO_TAG[t]
-    for canon, aliases in _TYPE_ALIASES.items():
-        if t == canon or t in aliases:
-            return _TYPE_CANON_TO_TAG.get(canon)
-    return t.title() if t else None
+def _extract_genres(item: dict) -> List[str]:
+    builtin = {"everyone","questionable","mature",
+               "video","scene","web","application","wallpaper","preset"}
+    out = []
+    for t in (item.get("tags") or []):
+        s = (t.get("tag") or "").strip()
+        if _norm_tag(s) not in builtin and not re.match(r"^\d+\s*(?:x|×)\s*\d+$", s.replace("X","x")):
+            out.append(s)
+    # 去重保序，压缩到前 8 个
+    seen, uniq = set(), []
+    for x in out:
+        n = _norm_tag(x)
+        if n not in seen:
+            seen.add(n); uniq.append(x)
+    return uniq[:8]
 
-def _type_matches(kv_type_val: str, tagset_lower: set, need_lower: set) -> bool:
-    if not need_lower:
-        return True
-    if kv_type_val:
-        t_l = kv_type_val.strip().lower()
-        if t_l in need_lower:
-            return True
-        for canon, aliases in _TYPE_ALIASES.items():
-            if t_l in aliases and (canon in need_lower or (need_lower & aliases)):
-                return True
-    if need_lower & tagset_lower:
-        return True
-    for t in tagset_lower:
-        if not t.startswith("type"):
-            continue
-        for sep in (":", "-", "—", "–"):
-            if sep in t:
-                right = t.split(sep, 1)[1].strip().lower()
-                if right in need_lower:
-                    return True
-                for canon, aliases in _TYPE_ALIASES.items():
-                    if right in aliases and (canon in need_lower or (need_lower & aliases)):
-                        return True
-    return False
-
-def filter_ids_with_details(base_ids: List[int], detail_map: Dict[int, dict], cfg: configparser.ConfigParser) -> List[int]:
-    tags = parse_csv(cfg.get("filters","tags",fallback=""))
-    show_only = parse_csv(cfg.get("filters","show_only",fallback=""))
-    types_in  = parse_csv(cfg.get("filters","types",fallback=""))
-    ages_csv = cfg.get("filters","age",fallback="")
-    res = cfg.get("filters","resolution",fallback="")
-    excluded = parse_csv(cfg.get("filters","exclude",fallback=""))
-
-    need_types_lower = {t.strip().lower() for t in types_in if t.strip()}
-    need_tags = [t for t in show_only if t.lower()!="approved"] + tags
-    kv_exact = [{"key":"resolution","value":res.strip()}] if res.strip() else []
+def filter_ids_with_details_AND(base_ids: List[int], detail_map: Dict[int, dict],
+                                cfg: configparser.ConfigParser) -> List[int]:
+    d = _build_dimensions(cfg)
+    need_genre = bool(d["genres_norm"])
+    need_type  = bool(d["types_norm"])
+    need_age   = bool(d["ages_norm"])
+    need_res   = bool(d["res_sets"])
+    exclude    = d["exclude_norm"]
 
     out: List[int] = []
     for fid in base_ids:
         it = detail_map.get(fid, {})
+        tags_norm = {_norm_tag((t.get("tag") or "").strip()) for t in (it.get("tags") or [])}
 
-        if excluded:
-            low = {(t.get("tag") or "").strip().lower() for t in (it.get("tags") or [])}
-            if any(x.lower() in low for x in excluded):
-                continue
-
-        if need_tags:
-            tset = {(t.get("tag") or "").strip() for t in (it.get("tags") or [])}
-            if not all(t in tset for t in need_tags):
-                continue
-
-        if kv_exact:
-            kv = _kv_lookup(it)
-            ok = True
-            for cond in kv_exact:
-                k = cond["key"].strip().lower()
-                if (kv.get(k,"") or "").strip() != cond["value"]:
-                    ok = False; break
-            if not ok:
-                continue
-
-        # ★ 年龄过滤（tags 优先，OR）
-        if not _age_match_any(it, ages_csv):
+        # exclude
+        if exclude and (exclude & tags_norm):
             continue
 
-        if need_types_lower:
-            kv = _kv_lookup(it)
-            kv_type_val = kv.get("type", "")
-            tagset_lower = {(t.get("tag") or "").strip().lower() for t in (it.get("tags") or [])}
-            if not _type_matches(kv_type_val, tagset_lower, need_types_lower):
-                continue
+        ok = True
+        # type
+        if need_type:
+            if not (d["types_norm"] & tags_norm):
+                ok = False
+        # age
+        if ok and need_age:
+            if not (d["ages_norm"] & tags_norm):
+                ok = False
+        # genre
+        if ok and need_genre:
+            if not (d["genres_norm"] & tags_norm):
+                ok = False
+        # resolution（tag 或 KV）
+        if ok and need_res:
+            res_ok = False
+            # tag 命中
+            if any(s & tags_norm for s in d["res_sets"]):
+                res_ok = True
+            else:
+                kv = _kv_lookup(it)
+                kv_val = (kv.get("resolution","") or "").strip()
+                if kv_val:
+                    kv_norms = {_norm_tag(x) for x in _normalize_resolution_variants(kv_val)}
+                    if any(s & kv_norms for s in d["res_sets"]):
+                        res_ok = True
+            if not res_ok:
+                ok = False
 
-        out.append(fid)
+        if ok:
+            out.append(fid)
+
     return out
 
-# ---------- steamcmd：实时进度（隐藏黑窗） ----------
+# ---------- steamcmd 与镜像/应用 ----------
 _PROGRESS_PAT = re.compile(r'(?P<pct>\d{1,3}(?:\.\d+)?)\s*%')
 _SPEED_PAT = re.compile(r'(?P<spd>[0-9.]+\s*(?:B/s|KB/s|MB/s|GB/s))', re.I)
 
@@ -667,13 +725,11 @@ def steamcmd_download_batch(exe: Path, uid: str, pwd: Optional[str], guard: Opti
     if guard: args += ["+set_steam_guard_code", guard]
     if pwd:   args += ["+login", uid, pwd]
     else:     args += ["+login", uid]
-
     for wid in ids:
         print(f"[task] 下载条目：{wid}  https://steamcommunity.com/sharedfiles/filedetails/?id={wid}")
         args += ["+workshop_download_item", str(APPID_WE), str(wid), "validate"]
     args += ["+quit"]
     print("[steamcmd]", " ".join(args))
-
     proc = subprocess.Popen(
         [str(exe), *args],
         stdout=subprocess.PIPE,
@@ -693,7 +749,6 @@ def steamcmd_download_batch(exe: Path, uid: str, pwd: Optional[str], guard: Opti
     finally:
         proc.wait(timeout=3600)
     out_s = all_out.getvalue()
-
     ok_markers = (
         "Logged in",
         "Loading Steam API...OK",
@@ -709,7 +764,6 @@ def steamcmd_download_batch(exe: Path, uid: str, pwd: Optional[str], guard: Opti
         print("[error] tail:\n" + tail)
     return ok, out_s
 
-# ---------- 镜像 / 应用 / 清理 ----------
 def mirror_dir(src: Path, dst: Path) -> bool:
     dst.mkdir(parents=True, exist_ok=True)
     try:
@@ -786,7 +840,7 @@ def delete_item_everywhere(wid: int, steamcmd_exe: Path, official_root: Path, we
                 try: shutil.rmtree(t, ignore_errors=True); print(f"[cleanup] deleted: {t}")
                 except Exception as e: print(f"[cleanup] delete failed: {t} -> {e}")
 
-# ---------- 日志 / 清理策略（不重写日志） ----------
+# ---------- 日志 / 状态 ----------
 _ID_IN_LINE = re.compile(r'id=(\d{6,})')
 
 def _read_logged_ids(logp: Path) -> List[int]:
@@ -803,6 +857,233 @@ def _read_logged_ids(logp: Path) -> List[int]:
             uniq.append(i); seen.add(i)
     return uniq
 
+def load_state(path: Path) -> Dict:
+    if path.exists():
+        try: return json.loads(path.read_text(encoding="utf-8"))
+        except Exception: pass
+    return {"tracked_ids": [], "last_applied": None, "history": [], "failed_recent": [], "cursor": 0}
+
+def save_state(path: Path, state: Dict) -> None:
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ---------- 候选获取 ----------
+def get_auto_candidates(cfg: configparser.ConfigParser) -> Tuple[List[int], Dict[int,dict]]:
+    key = (cfg.get("steam","api_key",fallback="") or "").strip()
+    if key:
+        ids_api, det_api, dbg = query_files_webapi_union_AND(cfg)
+        print(f"[auto/api] debug: {dbg}")
+        return ids_api, det_api
+    else:
+        ids_html = community_ids_html_union(cfg)
+        if not ids_html:
+            return [], {}
+        det_more = fetch_details(ids_html, https_proxy=cfg.get("network","https_proxy",fallback="").strip())
+        filtered = filter_ids_with_details_AND(ids_html, det_more, cfg)
+        print(f"[auto/html] candidates after AND filter: {len(filtered)} (from {len(ids_html)} raw)")
+        return filtered, {i: det_more[i] for i in filtered if i in det_more}
+
+# ---------- 元信息打印 ----------
+def _print_item_meta(fid: int, it: dict):
+    tps = _extract_type_tags(it)
+    age = _extract_age_tag(it) or "-"
+    res = _extract_resolution_strings(it)
+    genres = _extract_genres(it)
+    tps_s = ", ".join(tps) if tps else "-"
+    res_s = ", ".join(res[:3]) if res else "-"
+    genres_s = ", ".join(genres) if genres else "-"
+    print(f"[meta] {fid} | Type: {tps_s} | Age: {age} | Resolution: {res_s} | Genres: {genres_s}")
+
+# ---------- 主执行 ----------
+def run_once(cfg: configparser.ConfigParser) -> str:
+    steamcmd_path = expand(cfg.get("paths","steamcmd",fallback=""))
+    if not steamcmd_path: raise RuntimeError("请在 [paths] steamcmd= 指定 steamcmd.exe")
+    steamcmd_exe = Path(steamcmd_path)
+    if not steamcmd_exe.exists(): raise RuntimeError(f"未找到 steamcmd：{steamcmd_exe}")
+
+    we_exe = locate_we_exe(cfg)
+    if not we_exe:
+        print("[wait] 未检测到 Wallpaper Engine 可执行文件。")
+        return "WAIT_WE"
+
+    official_root = locate_workshop_root(cfg)
+    if not official_root:
+        print("[wait] 未发现已就绪的 Workshop 目录。")
+        return "WAIT_WS"
+    print("[workshop] official root:", official_root)
+
+    ids_conf = [int(x) for x in parse_csv(cfg.get("subscribe","ids",fallback="")) if x.isdigit()]
+    det_all: Dict[int,dict] = {}
+
+    if ids_conf:
+        ids_all = list(dict.fromkeys(ids_conf))
+        print(f"[subscribe] ids from config: {len(ids_all)}")
+        # 为了打印元信息，拉一下详情
+        det_all.update(fetch_details(ids_all, https_proxy=cfg.get("network","https_proxy",fallback="").strip()))
+    else:
+        ids_all, det_all = get_auto_candidates(cfg)
+
+    if not ids_all:
+        print("[pick] 无候选；请放宽 [filters] 或在 [subscribe] 填 ids。")
+        return "NO_CANDIDATES"
+
+    state_file = HERE / cfg.get("paths","state_file",fallback="we_auto_state.json")
+    state = load_state(state_file)
+
+    logp = HERE / cfg.get("logging","file",fallback="we_downloads.log")
+    seen_ids = set(_read_logged_ids(logp))
+    try:
+        seen_ids.update(_safe_int(x, 0) for x in state.get("history", []) if _safe_int(x, 0) > 0)
+    except Exception:
+        pass
+    fresh_ids = [i for i in ids_all if i not in seen_ids]
+    if fresh_ids:
+        print(f"[rotate] 优先未用过的候选：{len(fresh_ids)} / {len(ids_all)}")
+        ids_all = fresh_ids
+    else:
+        print("[rotate] 候选全部都在历史里；暂时允许重复（已尽力避免）。")
+
+    one_per_run = _cfg_bool(cfg, "subscribe", "one_per_run", True)
+    rotate_if_all_done = _cfg_bool(cfg, "subscribe", "rotate_if_all_done", True)
+    max_attempts = _cfg_int(cfg, "subscribe", "max_attempts_per_run", 5)
+
+    n = len(ids_all)
+    cur = _safe_int(state.get("cursor", 0), 0)
+    if cur >= n:
+        if rotate_if_all_done: cur = 0
+        else:
+            print("[pick] 所有候选已轮完；等待下次刷新。")
+            save_state(state_file, state)
+            return "DONE"
+
+    # 选本轮尝试名单
+    if one_per_run:
+        attempt_ids: List[int] = []
+        max_try = min(max_attempts, n if rotate_if_all_done else (n - cur))
+        for k in range(max_try):
+            idx = cur + k
+            if idx >= n:
+                if rotate_if_all_done:
+                    idx = (cur + k) % n
+                else:
+                    break
+            attempt_ids.append(ids_all[idx])
+        print(f"[pick] 本轮尝试顺序（最多 {len(attempt_ids)} 次）：{attempt_ids}")
+    else:
+        attempt_ids = ids_all
+        print(f"[pick] 非 one_per_run 模式：本轮将处理 {len(attempt_ids)} 个条目")
+
+    # 为了打印元信息，补全尝试条目的详情
+    miss_ids = [i for i in attempt_ids if i not in det_all]
+    if miss_ids:
+        det_all.update(fetch_details(miss_ids, https_proxy=cfg.get("network","https_proxy",fallback="").strip()))
+    print("[pick] 待尝试元信息：")
+    for wid in attempt_ids:
+        it = det_all.get(wid, {})
+        _print_item_meta(wid, it)
+
+    applied = False
+    attempts_made = 0
+    base_tmp_root = steamcmd_exe.parent / "steamapps" / "workshop" / "content" / str(APPID_WE)
+    current_wid: Optional[int] = None
+
+    for wid in attempt_ids:
+        attempts_made += 1
+        current_wid = wid
+
+        username = cfg.get("auth","steam_username",fallback="").strip() or os.environ.get("STEAM_USERNAME","").strip()
+        password = cfg.get("auth","steam_password",fallback=os.environ.get("STEAM_PASSWORD","")).strip() or None
+        guard    = cfg.get("auth","steam_guard_code",fallback=os.environ.get("STEAM_GUARD_CODE","")).strip() or None
+        if not username:
+            raise RuntimeError("请在 [auth] steam_username= 配置你的 Steam 账号")
+        print(f"[login] 账号：{username}（若未提供密码/验证码将尝试用已保存凭证）")
+        ok, _ = steamcmd_download_batch(steamcmd_exe, username, password, guard, [wid])
+        if not ok:
+            save_state(state_file, state)
+            raise RuntimeError("steamcmd 登录或下载失败")
+
+        src = base_tmp_root / str(wid)
+        if not src.exists() or not any(src.rglob("*")):
+            print(f"[skip] 未找到下载目录：{src}，尝试下一个...")
+            state.setdefault("failed_recent", []).append(wid)
+            continue
+
+        dst = official_root / str(wid)
+        print(f"[mirror] {src} -> {dst}")
+        if not mirror_dir(src, dst):
+            print(f"[warn] 镜像失败：{wid}；继续下一个。")
+            state.setdefault("failed_recent", []).append(wid)
+            continue
+
+        proj_dst = mirror_to_projects_backup(we_exe, dst, wid)
+        if proj_dst: print(f"[integrate] mirrored to projects/backup: {proj_dst}")
+
+        entry = find_entry(dst) or find_entry(src)
+        if not entry:
+            print(f"[warn] 未找到可应用入口（project.json/index.html/视频），跳过 {wid}")
+            state.setdefault("failed_recent", []).append(wid)
+            continue
+
+        # 应用前再次打印该条元信息，便于确认
+        print("[apply] 即将应用：")
+        _print_item_meta(wid, det_all.get(wid, {}))
+        try:
+            apply_in_we(entry, we_exe)
+            applied = True
+            state["last_applied"] = wid
+            hist = state.get("history", []); hist.append(wid); state["history"] = hist[-500:]
+            if _cfg_bool(cfg,"logging","enable",True):
+                with (HERE / cfg.get("logging","file",fallback="we_downloads.log")).open("a", encoding="utf-8") as f:
+                    f.write(f"[{now_str()}] https://steamcommunity.com/sharedfiles/filedetails/?id={wid}\n")
+
+            # 清理旧项（包 try，避免异常把 applied 变 False）
+            try:
+                cleanup_all_others_if_needed(wid, cfg, steamcmd_exe, official_root, we_exe)
+            except Exception as e:
+                print("[cleanup] 忽略清理异常：", e)
+
+            # 跟踪
+            prev_tracked: List[int] = []
+            for t in state.get("tracked_ids", []):
+                ti = _safe_int(t, 0)
+                if ti > 0:
+                    prev_tracked.append(ti)
+            tracked = list(dict.fromkeys([wid] + prev_tracked))
+            state["tracked_ids"] = tracked[:30]
+
+        except subprocess.CalledProcessError as e:
+            print("[warn] 应用失败：", e)
+            state.setdefault("failed_recent", []).append(wid)
+            applied = False
+        except Exception as e:
+            print("[warn] 应用异常：", e)
+            state.setdefault("failed_recent", []).append(wid)
+            applied = False
+
+        if one_per_run and applied:
+            break
+
+    if attempts_made > 0:
+        if _cfg_bool(cfg, "subscribe", "rotate_if_all_done", True):
+            state["cursor"] = (cur + attempts_made) % n
+        else:
+            state["cursor"] = min(n, cur + attempts_made)
+
+    if one_per_run and (not applied) and (current_wid is not None):
+        dst_try = official_root / str(current_wid)
+        src_try = steamcmd_exe.parent / "steamapps" / "workshop" / "content" / str(APPID_WE) / str(current_wid)
+        entry = find_entry(dst_try) or find_entry(src_try)
+        if entry:
+            print(f"[apply/fallback] {entry}")
+            try:
+                apply_in_we(entry, we_exe); applied = True
+            except Exception as e:
+                print("[warn] 兜底应用失败：", e)
+
+    save_state(state_file, state)
+    print("[done] 本轮完成。")
+    return "DONE"
+
+# ---------- 清理（保持不变） ----------
 def cleanup_all_others_if_needed(current_wid: int,
                                  cfg: configparser.ConfigParser,
                                  steamcmd_exe: Path,
@@ -849,327 +1130,9 @@ def cleanup_all_others_if_needed(current_wid: int,
             continue
         delete_item_everywhere(wid, steamcmd_exe, official_root, we_exe, use_recycle_bin=use_bin)
 
-# ---------- 状态 ----------
-def load_state(path: Path) -> Dict:
-    if path.exists():
-        try: return json.loads(path.read_text(encoding="utf-8"))
-        except Exception: pass
-    return {"tracked_ids": [], "last_applied": None, "history": [], "failed_recent": [], "cursor": 0}
-
-def save_state(path: Path, state: Dict) -> None:
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-# ---------- 候选获取（支持过滤后最小候选数） ----------
-def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
-    key = (cfg.get("steam","api_key",fallback="") or "").strip()
-    min_candidates = _cfg_int(cfg, "filters", "min_candidates", 0)
-    https_proxy = cfg.get("network","https_proxy",fallback="").strip()
-    sort_name = cfg.get("sort","method",fallback="Most Popular (Week)")
-    pages = _cfg_int(cfg, "fallback", "pages", 3)
-    page_size = _cfg_int(cfg, "filters", "numperpage", _cfg_int(cfg, "fallback", "page_size", 40))
-
-    if key and min_candidates > 0:
-        print(f"[auto/api] min_candidates={min_candidates}, page_size={page_size}")
-        from requests.adapters import HTTPAdapter  # 确保 requests 存在
-        sess = _make_session(https_proxy)
-
-        qtype, days = map_sort_to_query(sort_name)
-        req_tags = [t for t in parse_csv(cfg.get("filters","show_only",fallback="")) if t.lower()!="approved"]
-        req_tags += parse_csv(cfg.get("filters","tags",fallback=""))
-        exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
-
-        # ★ 单值 age/type → 服务端 requiredtags
-        age_tag = _age_single_workshop_tag_from_csv(cfg.get("filters","age",fallback=""))
-        if age_tag:
-            req_tags = list(dict.fromkeys(req_tags + [age_tag]))
-        type_tag = _single_type_workshop_tag_from_csv(cfg.get("filters","types",fallback=""))
-        if type_tag:
-            req_tags = list(dict.fromkeys(req_tags + [type_tag]))
-
-        base_url = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
-        ids: List[int] = []
-        det: Dict[int, dict] = {}
-        cursor = "*"
-        p = 0
-        max_pages = max(pages, _cfg_int(cfg, "fallback", "max_pages", 30))
-
-        while True:
-            p += 1
-            payload = {
-                "query_type": qtype,
-                "appid": APPID_WE,
-                "numperpage": page_size,
-                "return_kv_tags": True,
-                "return_tags": True,
-                "return_children": False,
-                "return_previews": False,
-                "match_all_tags": True,
-                "filetype": 0,
-                "mature_content": True,
-                "include_mature": True,
-                "cache_max_age_seconds": 60,
-            }
-            if qtype == 3 and days:
-                payload["days"] = days
-                payload["include_recent_votes_only"] = False
-            if req_tags:
-                payload["requiredtags"] = req_tags
-            if exc_tags:
-                payload["excludedtags"] = exc_tags
-            if cursor:
-                payload["cursor"] = cursor
-            else:
-                payload["page"] = p
-
-            params = {"key": key, "input_json": json.dumps(payload, separators=(",", ":"))}
-
-            try:
-                r = sess.get(base_url, params=params, timeout=(8, 25))
-                print(f"[auto/api] p{p} -> HTTP {r.status_code}")
-                if not r.ok:
-                    t = (r.text or "")[:200].replace("\n"," ")
-                    print(f"[auto/api] body: {t}")
-                    break
-
-                resp = r.json().get("response", {}) or {}
-                items = resp.get("publishedfiledetails") or resp.get("files") or resp.get("items") or []
-                if not items:
-                    print(f"[auto/api] p{p}: empty items")
-                    break
-
-                for it in items:
-                    fid = int(str(it.get("publishedfileid", "0")))
-                    if not fid: continue
-                    if fid not in det:
-                        det[fid] = it
-                        ids.append(fid)
-
-                filtered = filter_ids_with_details(ids, det, cfg)
-                print(f"[auto/api] after p{p}: raw={len(ids)} filtered={len(filtered)}")
-                if len(filtered) >= min_candidates:
-                    print("[auto/api] 达到 min_candidates，停止继续翻页。")
-                    return filtered
-
-                cursor = resp.get("next_cursor", "")
-                if (not cursor) or (len(items) < page_size):
-                    print("[auto/api] 没有更多页面。")
-                    return filtered
-                if p >= max_pages:
-                    print(f"[auto/api] 达到 max_pages={max_pages}。")
-                    return filtered
-
-            except Exception as e:
-                print(f"[auto/api] exception: {e!r}")
-                break
-
-        filtered = filter_ids_with_details(ids, det, cfg)
-        print(f"[auto/api] fallback filtered={len(filtered)}")
-        return filtered
-
-    if key:
-        ids_api, det_api, dbg = query_files_webapi(cfg)
-        print(f"[auto/api] debug: {dbg}")
-        if ids_api:
-            filtered = filter_ids_with_details(ids_api, det_api, cfg)
-            print(f"[auto/api] candidates after filter: {len(filtered)} (raw {len(ids_api)})")
-            return filtered
-        print("[auto/api] 0 条（或请求失败）。因为配置了 api_key，不回退 HTML。请检查 filters/sort。")
-        return []
-
-    # HTML 回退（无 api_key）
-    ages_csv = cfg.get("filters","age",fallback="")
-    types_csv = cfg.get("filters","types",fallback="")
-    ids_html = community_ids_html(sort_name, pages, page_size,
-                                  https_proxy=https_proxy, ages_csv=ages_csv, types_csv=types_csv)
-    if not ids_html: return []
-    det_more = fetch_details(ids_html, https_proxy=https_proxy)
-    filtered = filter_ids_with_details(ids_html, det_more, cfg)
-    print(f"[auto/html] candidates after filter: {len(filtered)} (from {len(ids_html)} raw)")
-    return filtered
-
-# ---------- 主执行（支持 skip 连续换下一个） ----------
-def run_once(cfg: configparser.ConfigParser) -> str:
-    steamcmd_path = expand(cfg.get("paths","steamcmd",fallback=""))
-    if not steamcmd_path: raise RuntimeError("请在 [paths] steamcmd= 指定 steamcmd.exe")
-    steamcmd_exe = Path(steamcmd_path)
-    if not steamcmd_exe.exists(): raise RuntimeError(f"未找到 steamcmd：{steamcmd_exe}")
-
-    we_exe = locate_we_exe(cfg)
-    if not we_exe:
-        print("[wait] 未检测到 Wallpaper Engine 可执行文件（可能磁盘未就绪/ISCSI 未挂载）。将于下个周期重试。")
-        return "WAIT_WE"
-
-    official_root = locate_workshop_root(cfg)
-    if not official_root:
-        print("[wait] 未发现已就绪的 Workshop 目录（可能 Steam 库所在磁盘未挂载或目录尚未创建）。将于下个周期重试。")
-        return "WAIT_WS"
-    print("[workshop] official root:", official_root)
-
-    ids_conf = [int(x) for x in parse_csv(cfg.get("subscribe","ids",fallback="")) if x.isdigit()]
-    if ids_conf:
-        ids_all = list(dict.fromkeys(ids_conf))
-        print(f"[subscribe] ids from config: {len(ids_all)}")
-    else:
-        ids_all = get_auto_candidates(cfg)
-
-    if not ids_all:
-        print("[pick] 无候选；请放宽 [filters] 或在 [subscribe] 填 ids。")
-        return "NO_CANDIDATES"
-
-    state_file = HERE / cfg.get("paths","state_file",fallback="we_auto_state.json")
-    state = load_state(state_file)
-
-    logp = HERE / cfg.get("logging","file",fallback="we_downloads.log")
-    seen_ids = set(_read_logged_ids(logp))
-    try:
-        seen_ids.update(_safe_int(x, 0) for x in state.get("history", []) if _safe_int(x, 0) > 0)
-    except Exception:
-        pass
-    fresh_ids = [i for i in ids_all if i not in seen_ids]
-    if fresh_ids:
-        print(f"[rotate] 优先未用过的候选：{len(fresh_ids)} / {len(ids_all)}")
-        ids_all = fresh_ids
-    else:
-        print("[rotate] 候选全部都在历史里；暂时允许重复（已尽力避免）。")
-
-    one_per_run = _cfg_bool(cfg, "subscribe", "one_per_run", True)
-    rotate_if_all_done = _cfg_bool(cfg, "subscribe", "rotate_if_all_done", True)
-    max_attempts = _cfg_int(cfg, "subscribe", "max_attempts_per_run", 5)
-
-    n = len(ids_all)
-    cur = _safe_int(state.get("cursor", 0), 0)
-    if cur >= n:
-        if rotate_if_all_done: cur = 0
-        else:
-            print("[pick] 所有候选已轮完；等待下次刷新。")
-            save_state(state_file, state)
-            return "DONE"
-
-    if one_per_run:
-        attempt_ids: List[int] = []
-        max_try = min(max_attempts, n if rotate_if_all_done else (n - cur))
-        for k in range(max_try):
-            idx = cur + k
-            if idx >= n:
-                if rotate_if_all_done:
-                    idx = (cur + k) % n
-                else:
-                    break
-            attempt_ids.append(ids_all[idx])
-        print(f"[pick] 本轮尝试顺序（最多 {len(attempt_ids)} 次）：{attempt_ids}")
-    else:
-        attempt_ids = ids_all
-        print(f"[pick] 非 one_per_run 模式：本轮将处理 {len(attempt_ids)} 个条目")
-
-    applied = False
-    attempts_made = 0
-    base_tmp_root = steamcmd_exe.parent / "steamapps" / "workshop" / "content" / str(APPID_WE)
-    current_wid: Optional[int] = None
-
-    for wid in attempt_ids:
-        attempts_made += 1
-        current_wid = wid
-
-        username = cfg.get("auth","steam_username",fallback="").strip() or os.environ.get("STEAM_USERNAME","").strip()
-        password = cfg.get("auth","steam_password",fallback=os.environ.get("STEAM_PASSWORD","")).strip() or None
-        guard    = cfg.get("auth","steam_guard_code",fallback=os.environ.get("STEAM_GUARD_CODE","")).strip() or None
-        if not username:
-            raise RuntimeError("请在 [auth] steam_username= 配置你的 Steam 账号（密码可留空以复用 steamcmd 已保存会话）")
-        print(f"[login] 账号：{username}（若未提供密码/验证码将尝试用已保存凭证）")
-        ok, out = steamcmd_download_batch(steamcmd_exe, username, password, guard, [wid])
-        if not ok:
-            save_state(state_file, state)
-            raise RuntimeError("steamcmd 登录或下载失败")
-
-        src = base_tmp_root / str(wid)
-        if not src.exists() or not any(src.rglob("*")):
-            print(f"[skip] 未找到下载目录：{src}（可能是合集占位/受限条目），尝试下一个...")
-            state.setdefault("failed_recent", []).append(wid)
-            if one_per_run:
-                continue
-            else:
-                continue
-
-        dst = official_root / str(wid)
-        print(f"[mirror] {src} -> {dst}")
-        if not mirror_dir(src, dst):
-            print(f"[warn] 镜像失败：{wid}；继续下一个。")
-            state.setdefault("failed_recent", []).append(wid)
-            if one_per_run:
-                continue
-            else:
-                continue
-
-        proj_dst = mirror_to_projects_backup(we_exe, dst, wid)
-        if proj_dst: print(f"[integrate] mirrored to projects/backup: {proj_dst}")
-
-        entry = find_entry(dst) or find_entry(src)
-        if not entry:
-            print(f"[warn] 未找到可应用入口文件（project.json/index.html/视频），跳过 {wid}")
-            state.setdefault("failed_recent", []).append(wid)
-            if one_per_run:
-                continue
-            else:
-                continue
-
-        print(f"[apply] {entry}")
-        try:
-            apply_in_we(entry, we_exe)
-            applied = True
-            state["last_applied"] = wid
-            hist = state.get("history", []); hist.append(wid); state["history"] = hist[-500:]
-            if _cfg_bool(cfg,"logging","enable",True):
-                with (HERE / cfg.get("logging","file",fallback="we_downloads.log")).open("a", encoding="utf-8") as f:
-                    f.write(f"[{now_str()}] https://steamcommunity.com/sharedfiles/filedetails/?id={wid}\n")
-            cleanup_all_others_if_needed(wid, cfg, steamcmd_exe, official_root, we_exe)
-
-            prev_tracked: List[int] = []
-            for t in state.get("tracked_ids", []):
-                ti = _safe_int(t, 0)
-                if ti > 0:
-                    prev_tracked.append(ti)
-            tracked = list(dict.fromkeys([wid] + prev_tracked))
-            state["tracked_ids"] = tracked[:30]
-
-        except subprocess.CalledProcessError as e:
-            print("[warn] 应用失败：", e)
-            state.setdefault("failed_recent", []).append(wid)
-            applied = False
-        except Exception as e:
-            print("[warn] 应用异常：", e)
-            state.setdefault("failed_recent", []).append(wid)
-            applied = False
-
-        if one_per_run and applied:
-            break
-
-    if attempts_made > 0:
-        if _cfg_bool(cfg, "subscribe", "rotate_if_all_done", True):
-            state["cursor"] = (cur + attempts_made) % n
-        else:
-            state["cursor"] = min(n, cur + attempts_made)
-
-    if one_per_run and (not applied) and (current_wid is not None):
-        dst_try = official_root / str(current_wid)
-        src_try = steamcmd_exe.parent / "steamapps" / "workshop" / "content" / str(APPID_WE) / str(current_wid)
-        entry = find_entry(dst_try) or find_entry(src_try)
-        if entry:
-            print(f"[apply/fallback] {entry}")
-            try:
-                apply_in_we(entry, we_exe); applied = True
-            except Exception as e:
-                print("[warn] 兜底应用失败：", e)
-
-    save_state(state_file, state)
-    print("[done] 本轮完成。")
-    return "DONE"
-
 # =========================
 # RUN_NOW 事件：唤醒并立刻执行一轮
 # =========================
-# 说明：
-# - 托盘/外部进程调用 SetEvent(Global\\WEAutoTrayRunNow_xxx) 后，本进程会从等待中醒来，立即 run_once。
-# - 事件为“手动复位”，收到后本进程会 ResetEvent，避免粘连。
 if os.name == "nt":
     kernel32 = ctypes.windll.kernel32
 else:
@@ -1204,7 +1167,6 @@ def _reset_event(h) -> None:
         except Exception: pass
 
 def _wait_run_now_or_timeout(h, timeout_s: float) -> bool:
-    """等待 RUN_NOW 事件或超时；返回 True 表示被事件触发提前唤醒。"""
     if os.name != "nt" or not kernel32 or not h:
         time.sleep(max(0.0, float(timeout_s))); return False
     ms = max(0, int(timeout_s * 1000))
@@ -1217,7 +1179,6 @@ def _wait_run_now_or_timeout(h, timeout_s: float) -> bool:
 
 # ---------- 入口 ----------
 def main():
-    # 可选：单次执行模式（不进入循环；便于脚本/计划任务调用）
     if "--once" in sys.argv:
         cfg = read_conf()
         try:
@@ -1232,7 +1193,6 @@ def main():
     if mode != "steamcmd":
         print(f"[exit] [subscribe].mode={mode}；本脚本仅实现 steamcmd 模式。"); return
 
-    # NEW: 创建/打开 RUN_NOW 事件
     run_now_evt = None
     if os.name == "nt":
         try:
@@ -1255,7 +1215,6 @@ def main():
             status = "ERROR"
 
     if interval_s <= 0:
-        # 无主循环，仅在 WAIT_* 下检测；用“事件或超时”代替纯 sleep
         while isinstance(status, str) and status.startswith("WAIT_"):
             _wait_run_now_or_timeout(run_now_evt, detect_s)
             try:
