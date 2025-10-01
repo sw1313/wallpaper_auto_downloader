@@ -9,6 +9,7 @@ we_auto_fetch.py — Steam Workshop -> Wallpaper Engine 自动拉取/筛选/应�
 - 分辨率兼容多写法（1280x720 / 1280 × 720 / 1280 x 720），tag 或 KV 都能匹配。
 - RUN_NOW 命名事件（配合托盘“立即更换一次”）、--once 单次执行模式。
 - 控制台会输出：各维度配置、抓取分页摘要、应用时该条目的 Type/Age/Resolution/Genres 等元信息。
+- HTML 排序映射修正：mostrecent / lastupdated / totaluniquesubscribers / trend(+days)。
 """
 
 from __future__ import annotations
@@ -271,7 +272,7 @@ def _make_session(https_proxy: str=""):
     if https_proxy:
         s.proxies.update({"https": https_proxy, "http": os.environ.get("http_proxy")})
     s.headers.update({
-        "User-Agent": "we-auto-fetch/steamcmd-webapi-or-AND-1.1 (+requests)",
+        "User-Agent": "we-auto-fetch/steamcmd-webapi-or-AND-1.2 (+requests)",
         "Accept": "application/json, text/html,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
@@ -289,6 +290,8 @@ def map_sort_to_query(sort_name: str) -> Tuple[int,int]:
         if "week" in s:  return 3, 7
         if "day" in s or "today" in s: return 3, 1
         return 3, 7
+    if s in ("last updated","recently updated","updated"):  # WebAPI 没有直接映射，退回 Most Recent
+        return 1, 0
     return 3, 7
 
 # ---------- 类型/年龄/分辨率 ----------
@@ -387,6 +390,34 @@ def _print_filters_summary(cfg: configparser.ConfigParser):
     print("  - Resolutions:", fmt_res(dims["res_sets"]))
     print("  - Exclude:", fmt(dims["exclude_norm"]))
 
+# ---------- 构造“查询用”的原始 include tag 列表（用于 requiredtags） ----------
+def _include_plain_tags_raw_for_queries(cfg: configparser.ConfigParser) -> List[str]:
+    inc: List[str] = []
+    # 原始 show_only + tags（保持用户的写法，含空格大小写）
+    inc += parse_csv(cfg.get("filters","show_only",fallback=""))
+    inc += parse_csv(cfg.get("filters","tags",fallback=""))
+    # types 映射为标准可见 tag（首字母大写）
+    types_in = [t.strip().lower() for t in parse_csv(cfg.get("filters","types",fallback=""))]
+    for t in types_in:
+        if t in _TYPE_CANON_TO_TAG:
+            inc.append(_TYPE_CANON_TO_TAG[t])
+        else:
+            hit = False
+            for canon, aliases in _TYPE_ALIASES.items():
+                if t == canon or t in aliases:
+                    inc.append(_TYPE_CANON_TO_TAG.get(canon, t.title())); hit = True; break
+            if not hit:
+                inc.append(t.title())
+    # age
+    ages_in = [x.strip().upper() for x in parse_csv(cfg.get("filters","age",fallback=""))]
+    inc += [_AGE_CANON_TO_TAG[a] for a in ages_in if a in _AGE_CANON_TO_TAG]
+    # 去重保序
+    seen, uniq = set(), []
+    for x in inc:
+        if x and x not in seen:
+            uniq.append(x); seen.add(x)
+    return uniq
+
 # ---------- WebAPI：按单 tag 抓取并集 ----------
 def _make_session_for_cfg(cfg):
     return _make_session(cfg.get("network","https_proxy",fallback="").strip())
@@ -422,25 +453,6 @@ def _query_webapi_single_tag(sess, key: str, qtype: int, days: int, npp: int,
     except Exception:
         return {}, ""
 
-def _include_tags_from_dims_for_queries(cfg) -> Tuple[List[str], List[str]]:
-    d = _build_dimensions(cfg)
-    include_plain = []  # 普通 tag：genres + types + ages
-    include_plain += list({x for x in d["genres_norm"]})
-    include_plain += list({x for x in d["types_norm"]})
-    include_plain += list({x for x in d["ages_norm"]})
-    # 反归一化：把无空格的规范值变回服务端常见写法（仅针对常见内置 tag，我们直接用首字母大写）
-    renorm = {"video":"Video","scene":"Scene","web":"Web","application":"Application","wallpaper":"Wallpaper","preset":"Preset",
-              "everyone":"Everyone","questionable":"Questionable","mature":"Mature"}
-    include_plain = [renorm.get(x, x) for x in include_plain]
-
-    # resolution：使用 'W x H'
-    res_req_tags = []
-    for r in parse_csv(cfg.get("filters","resolution",fallback="")):
-        vars = _normalize_resolution_variants(r)
-        if vars:
-            res_req_tags.append(vars[0])
-    return include_plain, res_req_tags
-
 def query_files_webapi_union_AND(cfg: configparser.ConfigParser) -> Tuple[List[int], Dict[int,dict], str]:
     key = (cfg.get("steam","api_key",fallback="") or "").strip()
     if not key:
@@ -455,8 +467,14 @@ def query_files_webapi_union_AND(cfg: configparser.ConfigParser) -> Tuple[List[i
     min_cands = _cfg_int(cfg, "filters", "min_candidates", 0)
 
     dims = _build_dimensions(cfg)
-    include_plain, res_req_tags = _include_tags_from_dims_for_queries(cfg)
-    exc_tags = list({x for x in parse_csv(cfg.get("filters","exclude",fallback=""))})
+    include_plain = _include_plain_tags_raw_for_queries(cfg)
+    # resolution：使用 'W x H'
+    res_req_tags = []
+    for r in parse_csv(cfg.get("filters","resolution",fallback="")):
+        vars = _normalize_resolution_variants(r)
+        if vars:
+            res_req_tags.append(vars[0])
+    exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
 
     tags_to_query: List[Optional[str]] = [*include_plain, *res_req_tags] if (include_plain or res_req_tags) else [None]
 
@@ -495,23 +513,39 @@ def query_files_webapi_union_AND(cfg: configparser.ConfigParser) -> Tuple[List[i
 # ---------- HTML 回退（并集抓取 + 维度 AND 过滤） ----------
 def map_sort_html(sort_name: str) -> Tuple[str,int]:
     s = (sort_name or "").lower()
-    if s == "top rated": return "vote", 0
+    # Top Rated
+    if s in ("top rated", "most up votes", "most upvoted", "top-rated"):
+        return "vote", 0
+    # Most Popular (Day/Week/Month/Year)
     if s.startswith("most popular"):
         if "year" in s:  return "trend", 365
         if "month" in s: return "trend", 30
         if "week" in s:  return "trend", 7
-        if "day" in s:   return "trend", 1
-        return "trend", 7
-    if s == "most recent": return "publicationdate", 0
-    if s in ("most subscriptions","most subscribed"): return "totaluniquesubscriptions", 0
+        if "day" in s or "today" in s: return "trend", 1
+        return "trend", 7  # 默认周榜
+    # Most Recent
+    if s in ("most recent", "newest", "recent"):
+        return "mostrecent", 0
+    # Last updated
+    if s in ("last updated", "recently updated", "updated"):
+        return "lastupdated", 0
+    # Most Subscriptions / Most Subscribed
+    if s in ("most subscriptions", "most subscribed", "subscriptions", "subscribed"):
+        return "totaluniquesubscribers", 0
+    # fallback
     return "trend", 7
 
 def _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, page, req_tag, exc_tags) -> List[int]:
     headers = {"Referer": f"{base_url}?appid={APPID_WE}&browsesort={comm_sort}"}
     params = {
-        "appid": str(APPID_WE), "browsesort": comm_sort, "days": str(comm_days or 0),
-        "actualsort": comm_sort, "l": "english", "numperpage": str(per_page), "p": str(page),
+        "appid": str(APPID_WE),
+        "browsesort": comm_sort,
+        "days": str(comm_days or 0),
         "section": "readytouseitems",
+        "l": "english",
+        "numperpage": str(per_page),
+        "p": str(page),
+        "actualsort": comm_sort,
     }
     if req_tag:
         params["requiredtags[]"] = [req_tag]
@@ -543,8 +577,15 @@ def community_ids_html_union(cfg: configparser.ConfigParser) -> List[int]:
     sess = _make_session_for_cfg(cfg)
     base_url = "https://steamcommunity.com/workshop/browse/"
 
-    include_plain, res_req_tags = _include_tags_from_dims_for_queries(cfg)
-    exc_tags = list({x for x in parse_csv(cfg.get("filters","exclude",fallback=""))})
+    include_plain = _include_plain_tags_raw_for_queries(cfg)
+    # resolution tags for server
+    res_req_tags = []
+    for r in parse_csv(cfg.get("filters","resolution",fallback="")):
+        vars = _normalize_resolution_variants(r)
+        if vars:
+            res_req_tags.append(vars[0])
+    exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
+
     tags_to_query: List[Optional[str]] = [*include_plain, *res_req_tags] if (include_plain or res_req_tags) else [None]
 
     ids, seen = [], set()
@@ -555,7 +596,7 @@ def community_ids_html_union(cfg: configparser.ConfigParser) -> List[int]:
             for fid in part:
                 if fid not in seen:
                     seen.add(fid); ids.append(fid)
-            if min_cands > 0 and len(ids) >= min_cands:  # 这里只能用粗略量；最终还会本地 AND 过滤
+            if min_cands > 0 and len(ids) >= min_cands:  # 粗略早停，最终还会本地 AND 过滤
                 return ids
             if len(part) < per_page:
                 break
@@ -609,7 +650,7 @@ def _extract_age_tag(item: dict) -> Optional[str]:
 def _extract_type_tags(item: dict) -> List[str]:
     out = []
     lows = {(t.get("tag") or "").strip().lower() for t in (item.get("tags") or [])}
-    for k,v in _TYPE_CANON_TO_TAG.items():
+    for _, v in _TYPE_CANON_TO_TAG.items():
         if v.lower() in lows:
             out.append(v)
     return out
@@ -641,7 +682,6 @@ def _extract_genres(item: dict) -> List[str]:
         s = (t.get("tag") or "").strip()
         if _norm_tag(s) not in builtin and not re.match(r"^\d+\s*(?:x|×)\s*\d+$", s.replace("X","x")):
             out.append(s)
-    # 去重保序，压缩到前 8 个
     seen, uniq = set(), []
     for x in out:
         n = _norm_tag(x)
@@ -683,7 +723,6 @@ def filter_ids_with_details_AND(base_ids: List[int], detail_map: Dict[int, dict]
         # resolution（tag 或 KV）
         if ok and need_res:
             res_ok = False
-            # tag 命中
             if any(s & tags_norm for s in d["res_sets"]):
                 res_ok = True
             else:
@@ -917,7 +956,6 @@ def run_once(cfg: configparser.ConfigParser) -> str:
     if ids_conf:
         ids_all = list(dict.fromkeys(ids_conf))
         print(f"[subscribe] ids from config: {len(ids_all)}")
-        # 为了打印元信息，拉一下详情
         det_all.update(fetch_details(ids_all, https_proxy=cfg.get("network","https_proxy",fallback="").strip()))
     else:
         ids_all, det_all = get_auto_candidates(cfg)
@@ -1083,7 +1121,7 @@ def run_once(cfg: configparser.ConfigParser) -> str:
     print("[done] 本轮完成。")
     return "DONE"
 
-# ---------- 清理（保持不变） ----------
+# ---------- 清理 ----------
 def cleanup_all_others_if_needed(current_wid: int,
                                  cfg: configparser.ConfigParser,
                                  steamcmd_exe: Path,
