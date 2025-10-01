@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-we_tray.py（Win32 托盘 · 登录完善最终版 r13）
+we_tray.py（Win32 托盘 · 登录完善最终版 r14）
 - 逐字符读取 + 静默间隙推断
-- 启动即监控“登录阶段”，解决只打印 banner 就卡住的情况
-- 等待手机批准：Tk 顶层 toast（非阻塞），在“登录成功/进入2FA”时自动销毁
+- 等待手机批准：Tk toast（非阻塞），在“登录成功/进入2FA”时自动销毁
 - 登录成功 toast：显示 5s 后自动关闭，然后再重启 worker（严格顺序）
+- [修复] 重启 worker 前 Reset 退出事件（否则新 worker 立即退出）
+- [防抖] 登录流程并发保护，避免重复触发
+- [稳健] “立即更换一次”改为脉冲触发（Set→短暂停→Reset）
 - 行级写回 config 的 [auth].steam_username（保留注释/格式）
-- PyInstaller 单文件：优先加载 EXE 内嵌图标，其次 MEIPASS/同目录，托盘图标稳定
+- PyInstaller 单文件：优先加载 EXE 内嵌图标，其次 MEIPASS/同目录
 - 隐藏 steamcmd 窗口（CREATE_NO_WINDOW + 兜底按 PID 隐藏顶层窗）
 """
 
@@ -24,9 +26,9 @@ WORKER_SCRIPT = "we_auto_fetch.py"
 WORKER_ARGS: list[str] = []
 MAX_BUFFER_LINES = 5000
 
-STEAMCMD_LOGIN_TIMEOUT_S = 45.0      # 登录尝试基础超时（秒）
-MOBILE_CONFIRM_MAX_WAIT_S = 60.0     # 侦测到“手机确认”后的延长等待（秒）
-MOBILE_GAP_DETECT_S = 6.0            # 静默间隙阈值（秒）
+STEAMCMD_LOGIN_TIMEOUT_S = 45.0
+MOBILE_CONFIRM_MAX_WAIT_S = 60.0
+MOBILE_GAP_DETECT_S = 6.0
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKER_SCRIPT_ABS = (SCRIPT_DIR / WORKER_SCRIPT).resolve()
@@ -252,6 +254,10 @@ MB_ICONINFORMATION    = 0x40
 MB_ICONERROR          = 0x10
 MB_OK                 = 0x00000000
 
+# --------- ResetEvent 绑定 ----------
+kernel32.ResetEvent.argtypes = [HANDLE]
+kernel32.ResetEvent.restype  = wintypes.BOOL
+
 # ----------------- 单实例 -----------------
 class SingleInstance:
     def __init__(self, name: str):
@@ -318,6 +324,16 @@ def _open_named_event(name: str):
 def _set_event(h) -> None:
     try: kernel32.SetEvent(h)
     except Exception: pass
+
+def _reset_event(h) -> None:
+    try: kernel32.ResetEvent(h)
+    except Exception: pass
+
+def _pulse_event(h, duration_s: float = 0.08):
+    """手动复位事件的脉冲触发：Set → 短暂停 → Reset。"""
+    _set_event(h)
+    try: time.sleep(max(0.02, duration_s))
+    finally: _reset_event(h)
 
 # ----------------- Job(Kill-on-close) -----------------
 class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
@@ -477,14 +493,12 @@ class ConsoleWindow:
                 win.attributes("-topmost", True)
             except Exception:
                 pass
-            # 内容
             frm = self._tk.Frame(win, bd=1, relief="solid")
             frm.pack(fill="both", expand=True)
             lbl_title = self._tk.Label(frm, text=title, font=("Segoe UI", 10, "bold"))
             lbl_title.pack(anchor="w", padx=12, pady=(10, 2))
             lbl_text = self._tk.Label(frm, text=text, wraplength=360, justify="left")
             lbl_text.pack(anchor="w", padx=12, pady=(0, 10))
-            # 位置：右下角
             win.update_idletasks()
             w = win.winfo_reqwidth()
             h = win.winfo_reqheight()
@@ -493,7 +507,6 @@ class ConsoleWindow:
             x = max(0, sw - w - 16)
             y = max(0, sh - h - 48)
             win.geometry(f"{w}x{h}+{x}+{y}")
-            # 点击即关闭
             win.bind("<Button-1>", lambda e: self.close_toast(key))
             self._toasts[key] = win
             if timeout_ms and timeout_ms > 0:
@@ -528,11 +541,8 @@ def _win_hidden_popen_kwargs():
         return {"creationflags": CREATE_NO_WINDOW}
 
 def _hide_top_windows_by_pid(pid: int, duration_s: float = 3.0, poll_interval_s: float = 0.1):
-    """兜底：在 duration_s 内反复枚举顶层窗口，凡属于 pid 的可见窗口都隐藏。"""
-    if not pid:
-        return
+    if not pid: return
     end_ts = time.time() + max(0.1, duration_s)
-
     @WNDENUMPROC
     def _enum_proc(hwnd, lparam):
         try:
@@ -546,7 +556,6 @@ def _hide_top_windows_by_pid(pid: int, duration_s: float = 3.0, poll_interval_s:
         except Exception:
             pass
         return True
-
     while time.time() < end_ts:
         try: user32.EnumWindows(_enum_proc, 0)
         except Exception: pass
@@ -753,6 +762,10 @@ class Win32TrayApp:
         self._mobile_prompt_shown = False
         self._mobile_prompt_lock = threading.Lock()
 
+        # 登录流程防抖
+        self._login_active = False
+        self._login_lock = threading.Lock()
+
         user32.LoadImageW.argtypes = [HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
                                       ctypes.c_int, ctypes.c_int, wintypes.UINT]
         user32.LoadImageW.restype = HANDLE
@@ -786,8 +799,7 @@ class Win32TrayApp:
         IMAGE_ICON      = 1
         LR_LOADFROMFILE = 0x00000010
         LR_DEFAULTSIZE  = 0x00000040
-
-        # 1) 优先：加载 EXE 内嵌图标（PyInstaller --icon）
+        # 1) EXE 内嵌
         try:
             hinst = kernel32.GetModuleHandleW(None)
             for resid in (1, 101):
@@ -800,8 +812,7 @@ class Win32TrayApp:
                     pass
         except Exception:
             pass
-
-        # 2) 其次：从 MEIPASS（one-file 临时目录）加载
+        # 2) MEIPASS
         try:
             meipass = getattr(sys, "_MEIPASS", "")
             if meipass:
@@ -814,8 +825,7 @@ class Win32TrayApp:
                             return HICON(h)
         except Exception:
             pass
-
-        # 3) 再尝试：EXE 所在目录、脚本目录
+        # 3) EXE 同目录 / 脚本目录
         for base in (Path(sys.executable).parent, Path(__file__).resolve().parent):
             for name in ("app.ico", "we.ico", "tray.ico"):
                 p = base / name
@@ -827,8 +837,7 @@ class Win32TrayApp:
                             return HICON(h)
                     except Exception:
                         pass
-
-        # 4) 最后：系统默认图标
+        # 4) 默认
         IDI_APPLICATION = 32512
         self.console.append("[tray] 未找到自定义图标，使用系统默认图标。")
         return user32.LoadIconW(None, MAKEINTRESOURCE(IDI_APPLICATION))
@@ -1008,7 +1017,7 @@ class Win32TrayApp:
             need_mobile_confirm=self._contains_any(out_low, mobile_kw),
         )
 
-    # ---------- 登录一次（逐字符读取 + 静默间隙推断） ----------
+    # ---------- 登录一次 ----------
     def _steamcmd_login_once(self, steamcmd_exe: Path, username: str, password: Optional[str], guard: Optional[str]) -> tuple[bool, str, dict, bool]:
         args = []
         if guard:
@@ -1026,10 +1035,8 @@ class Win32TrayApp:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
-            **_win_hidden_popen_kwargs()  # 关键：隐藏控制台窗口
+            **_win_hidden_popen_kwargs()
         )
-
-        # 兜底：若 steamcmd 仍弹窗，3 秒内持续隐藏其顶层窗口
         threading.Thread(target=lambda: _hide_top_windows_by_pid(p.pid, duration_s=3.0),
                          daemon=True).start()
 
@@ -1048,7 +1055,6 @@ class Win32TrayApp:
                     try: p.kill()
                     except Exception: pass
 
-        # 总超时计时器
         timer = [None]
         def _start_timer(seconds: float):
             if timer[0] is not None:
@@ -1065,15 +1071,12 @@ class Win32TrayApp:
         login_phase_started = {"v": True}
         mobile_hint_shown = {"v": False}
 
-        # 静默间隙看门狗：提示“请在手机上确认”
         def _gap_watchdog():
             nonlocal last_activity_ts
             while not finished["v"] and p.poll() is None:
                 time.sleep(0.5)
-                if mobile_hint_shown["v"]:
-                    continue
-                if not login_phase_started["v"]:
-                    continue
+                if mobile_hint_shown["v"]: continue
+                if not login_phase_started["v"]: continue
                 gap = time.time() - last_activity_ts
                 if gap >= MOBILE_GAP_DETECT_S:
                     with self._mobile_prompt_lock:
@@ -1084,7 +1087,7 @@ class Win32TrayApp:
                             self.console.show_toast(
                                 key="mobile_confirm",
                                 title="请在手机上确认",
-                                text=f"正在等待你在手机端批准这次登录。\n本轮等待已延长至 {int(MOBILE_CONFIRM_MAX_WAIT_S)} 秒。",
+                                text=f"很可能正在等待你在手机端批准这次登录。\n本轮等待已延长至 {int(MOBILE_CONFIRM_MAX_WAIT_S)} 秒。",
                                 timeout_ms=int(MOBILE_CONFIRM_MAX_WAIT_S * 1000)
                             )
                             _start_timer(MOBILE_CONFIRM_MAX_WAIT_S)
@@ -1095,7 +1098,6 @@ class Win32TrayApp:
 
         threading.Thread(target=_gap_watchdog, daemon=True).start()
 
-        # 逐字符读取
         try:
             assert p.stdout is not None
             line_buf = bytearray()
@@ -1113,7 +1115,6 @@ class Win32TrayApp:
                     all_text = all_bytes.decode("utf-8", errors="ignore")
                 low = all_text.lower()
 
-                # 直接关键字命中“等待确认” → toast
                 if (not mobile_hint_shown["v"]) and (
                     ("waiting for confirmation" in low) or
                     ("waiting for your confirmation" in low) or
@@ -1134,7 +1135,6 @@ class Win32TrayApp:
                             )
                             _start_timer(MOBILE_CONFIRM_MAX_WAIT_S)
 
-                # 行回显
                 if b in (b"\n", b"\r") and line_buf:
                     try:
                         self.console.append(line_buf.decode(enc, errors="ignore").rstrip("\r\n"))
@@ -1142,7 +1142,6 @@ class Win32TrayApp:
                         self.console.append(line_buf.decode("utf-8", errors="ignore").rstrip("\r\n"))
                     line_buf.clear()
 
-            # 残留半行
             if line_buf:
                 try:
                     self.console.append(line_buf.decode(enc, errors="ignore"))
@@ -1180,7 +1179,6 @@ class Win32TrayApp:
         return ok, out, flags, timed_out["v"]
 
     def _restart_worker_after_success_toast(self):
-        # 成功 toast 5s 后再重启 worker
         self.console.show_toast(
             key="login_success",
             title="登录成功",
@@ -1195,77 +1193,90 @@ class Win32TrayApp:
     def _restart_worker(self):
         try:
             self.console.append("[login] 正在重启 worker 以应用新账号 ...")
+            # 1) 通知退出 + 等待
             self._signal_worker_exit_and_wait(wait_s=2.5)
+            # 2) **关键**：Reset 退出事件，避免新 worker 立即退出
+            _reset_event(self._exit_evt)
         except Exception:
             pass
         try:
+            # 3) 启动新 worker
             self.wp = start_worker_and_reader(self.console, job_handle=self._job)
             self.console.append("[login] worker 已重启。")
         except Exception as e:
             self.console.append(f"[login] 重启 worker 失败：{e}")
 
-    # ---------- 登录主流程 ----------
+    # ---------- 登录主流程（带并发防抖） ----------
     def _login_flow_wincred(self):
-        steamcmd = self._get_steamcmd_from_cfg()
-        if not steamcmd:
-            self._msg_error("登录", "缺少 steamcmd 路径：请先在配置 [paths] 中设置 steamcmd= 的绝对路径。")
-            return
-
-        username: str = ""
-        for _ in range(3):
-            cred = self._cred_prompt(
-                caption="登录 Steam 账号",
-                message="请输入 Steam 账号与密码。\n（密码不会被保存，仅用于本次登录）",
-                target="steam://login",
-                default_user=username
-            )
-            if not cred:
-                self.console.append("[login] 用户取消了账号输入。"); return
-            username, password = cred
-
-            ok, out, flags, timed_out = self._steamcmd_login_once(steamcmd, username, password, guard=None)
-
-            if flags.get("invalid_pw"):
-                self._msg_error("登录失败", "密码不正确，请重新输入。")
-                continue
-
-            if ok:
-                self.console.close_toast("mobile_confirm")
-                try: self._save_username_to_cfg_preserve(username)
-                except Exception as e: self.console.append(f"[login] 写入配置失败：{e}")
-                self._restart_worker_after_success_toast()
+        with self._login_lock:
+            if self._login_active:
+                self.console.append("[login] 登录流程已在进行中，忽略重复触发。")
+                return
+            self._login_active = True
+        try:
+            steamcmd = self._get_steamcmd_from_cfg()
+            if not steamcmd:
+                self._msg_error("登录", "缺少 steamcmd 路径：请先在配置 [paths] 中设置 steamcmd= 的绝对路径。")
                 return
 
-            if flags.get("need_mobile_confirm") or flags.get("maybe_waiting_mobile") or timed_out:
-                self.console.append("[login] 手机确认等待未完成，转入 2FA 验证码流程。")
-
-            self.console.close_toast("mobile_confirm")
-
-            for _try in range(3):
-                cred2 = self._cred_prompt(
-                    caption="输入 2FA 验证码",
-                    message=("此账号开启了 Steam Guard 二次验证。\n"
-                             "请在“密码”一栏输入 **5 位**（或 **6 位**）验证码；不区分大小写，可直接输入。"),
-                    target="steam://guard",
+            username: str = ""
+            for _ in range(3):
+                cred = self._cred_prompt(
+                    caption="登录 Steam 账号",
+                    message="请输入 Steam 账号与密码。\n（密码不会被保存，仅用于本次登录）",
+                    target="steam://login",
                     default_user=username
                 )
-                if not cred2:
-                    self.console.append("[login] 用户取消了手机令牌输入。"); break
-                _, guard = cred2
-                ok2, out2, flags2, _ = self._steamcmd_login_once(steamcmd, username, password, guard=guard)
-                if flags2.get("invalid_pw"):
-                    self._msg_error("登录失败", "密码已失效或被修改，请返回重输密码。")
-                    break
-                if ok2:
+                if not cred:
+                    self.console.append("[login] 用户取消了账号输入。"); return
+                username, password = cred
+
+                ok, out, flags, timed_out = self._steamcmd_login_once(steamcmd, username, password, guard=None)
+
+                if flags.get("invalid_pw"):
+                    self._msg_error("登录失败", "密码不正确，请重新输入。")
+                    continue
+
+                if ok:
                     self.console.close_toast("mobile_confirm")
                     try: self._save_username_to_cfg_preserve(username)
                     except Exception as e: self.console.append(f"[login] 写入配置失败：{e}")
                     self._restart_worker_after_success_toast()
                     return
-                self._msg_error("登录失败", "验证码/令牌无效或登录失败，请重试。")
-            continue
 
-        self._msg_error("登录失败", "多次尝试未成功。请检查账号/密码/验证码后再试。")
+                if flags.get("need_mobile_confirm") or flags.get("maybe_waiting_mobile") or timed_out:
+                    self.console.append("[login] 手机确认等待未完成，转入 2FA 验证码流程。")
+
+                self.console.close_toast("mobile_confirm")
+
+                for _try in range(3):
+                    cred2 = self._cred_prompt(
+                        caption="输入 2FA 验证码",
+                        message=("此账号开启了 Steam Guard 二次验证。\n"
+                                 "请在“密码”一栏输入 **5 位**（或 **6 位**）验证码；不区分大小写，可直接输入。"),
+                        target="steam://guard",
+                        default_user=username
+                    )
+                    if not cred2:
+                        self.console.append("[login] 用户取消了手机令牌输入。"); break
+                    _, guard = cred2
+                    ok2, out2, flags2, _ = self._steamcmd_login_once(steamcmd, username, password, guard=guard)
+                    if flags2.get("invalid_pw"):
+                        self._msg_error("登录失败", "密码已失效或被修改，请返回重输密码。")
+                        break
+                    if ok2:
+                        self.console.close_toast("mobile_confirm")
+                        try: self._save_username_to_cfg_preserve(username)
+                        except Exception as e: self.console.append(f"[login] 写入配置失败：{e}")
+                        self._restart_worker_after_success_toast()
+                        return
+                    self._msg_error("登录失败", "验证码/令牌无效或登录失败，请重试。")
+                continue
+
+            self._msg_error("登录失败", "多次尝试未成功。请检查账号/密码/验证码后再试。")
+        finally:
+            with self._login_lock:
+                self._login_active = False
 
     # ---------- 退出/消息循环 ----------
     def _signal_worker_exit_and_wait(self, wait_s: float = 3.0):
@@ -1286,7 +1297,6 @@ class Win32TrayApp:
         except Exception: pass
         try:
             self._signal_worker_exit_and_wait(wait_s=3.0)
-            self.console.append("[exit] worker 已停止（或将被 Job 回收）。")
         except Exception: pass
         try:
             self.console.stop()
@@ -1316,7 +1326,9 @@ class Win32TrayApp:
             self.console.toggle()
         elif cmd == IDM_FORCE_SWITCH:
             self.console.append("[action] 立即更换一次：已通知 worker 立刻执行一轮。")
-            try: _set_event(self._run_now_evt)
+            try:
+                # 脉冲触发，避免长时间保持置位影响后续逻辑
+                _pulse_event(self._run_now_evt, duration_s=0.08)
             except Exception:
                 self.console.append("[action] 通知失败：RUN_NOW 事件句柄无效。")
         elif cmd == IDM_TOGGLE_AUTOSTART:
@@ -1352,7 +1364,11 @@ class Win32TrayApp:
             self._on_cmd(wparam & 0xFFFF); return 0
 
         if msg == WM_APP_LOGIN:
-            threading.Thread(target=self._login_flow_wincred, daemon=True).start()
+            # 防止重复登录线程
+            if not self._login_active:
+                threading.Thread(target=self._login_flow_wincred, daemon=True).start()
+            else:
+                self.console.append("[login] 登录流程已在进行中（WM）。")
             return 0
 
         if msg == WM_DESTROY:
