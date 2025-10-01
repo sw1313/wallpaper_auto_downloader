@@ -10,10 +10,11 @@ we_auto_fetch.py — Steam Workshop -> Wallpaper Engine 自动拉取/筛选/应�
 - RUN_NOW 命名事件（配合托盘“立即更换一次”）、--once 单次执行模式。
 - 控制台会输出：各维度配置、抓取分页摘要、应用时该条目的 Type/Age/Resolution/Genres 等元信息。
 - HTML 排序映射修正：mostrecent / lastupdated / totaluniquesubscribers / trend(+days)。
+- **修复“卡在即将应用”**：应用壁纸时不再等待 wallpaper32/64.exe 退出；先确保 WE 在运行，再用短超时发送 -control 命令。
 """
 
 from __future__ import annotations
-import configparser, json, os, re, shutil, subprocess, sys, time, io, ctypes, hashlib
+import configparser, json, os, re, shutil, subprocess, sys, time, io, ctypes, hashlib, locale
 from ctypes import wintypes
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -253,6 +254,32 @@ def locate_workshop_root(cfg: configparser.ConfigParser) -> Optional[Path]:
         if _path_ready(r):
             return r
     return None
+
+# ---------- Wallpaper Engine 运行检测/确保运行 ----------
+def _is_proc_running(*names: str) -> bool:
+    """不用 psutil，直接 tasklist 粗查。"""
+    if os.name != "nt":
+        return False
+    try:
+        out = subprocess.check_output(["tasklist"], **_win_hidden_popen_kwargs())
+        enc = "mbcs" if os.name == "nt" else (locale.getpreferredencoding(False) or "utf-8")
+        text = out.decode(enc, errors="ignore").lower()
+        return any(n.lower() in text for n in names)
+    except Exception:
+        return False
+
+def _ensure_we_running(we_bin: Path, wait_s: float = 15.0) -> None:
+    """
+    确保 Wallpaper Engine 主进程在运行；若没运行就静默拉起并轮询到就绪。
+    """
+    if _is_proc_running("wallpaper64.exe", "wallpaper32.exe", "wallpaper_engine.exe"):
+        return
+    subprocess.Popen([str(we_bin)], **_win_hidden_popen_kwargs())  # 不等待，静默启动
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        if _is_proc_running("wallpaper64.exe", "wallpaper32.exe", "wallpaper_engine.exe"):
+            return
+        time.sleep(0.3)
 
 # ---------- HTTP ----------
 def _make_session(https_proxy: str=""):
@@ -838,20 +865,46 @@ def find_entry(work_dir: Path) -> Optional[Path]:
     vids = list(work_dir.rglob("*.mp4")) or list(work_dir.rglob("*.webm"))
     return vids[0] if vids else None
 
-def apply_in_we(entry: Path, we_exe: Path, retries: int = 3, delay_s: float = 1.5) -> None:
+def apply_in_we(entry: Path, we_exe: Path, retries: int = 2, delay_s: float = 1.0,
+                monitor: Optional[int] = None, send_timeout_s: float = 2.0) -> None:
+    """
+    改为“非阻塞发送命令”模式，避免卡住：
+    1) 确保 Wallpaper Engine 主进程在运行；
+    2) 通过 -control openWallpaper 发送切换命令；
+    3) 最多等待 send_timeout_s 秒（仅等待命令发送程序返回），超时亦视为已发送成功。
+    """
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            subprocess.run([str(we_exe), "-control", "openWallpaper", "-file", str(entry)], check=True)
-            return
-        except subprocess.CalledProcessError as e:
-            last_err = e
-            print(f"[apply/retry] 第 {attempt} 次失败，将在 {delay_s}s 后重试：{e}")
-            time.sleep(delay_s)
+            _ensure_we_running(we_exe, wait_s=15.0)
+
+            cmd = [str(we_exe), "-control", "openWallpaper", "-file", str(entry)]
+            if monitor is not None:
+                cmd += ["-monitor", str(monitor)]
+
+            print(f"[apply] 调用：{Path(we_exe).name} -control openWallpaper -file \"{entry}\""
+                  + (f" -monitor {monitor}" if monitor is not None else ""))
+
+            p = subprocess.Popen(cmd, **_win_hidden_popen_kwargs())
+            try:
+                rc = p.wait(timeout=send_timeout_s)
+                if rc == 0:
+                    print("[apply] 已将壁纸指令发送给 Wallpaper Engine。")
+                    return
+                else:
+                    # 返回非零也可能不致命，重试一次
+                    print(f"[apply] 命令进程返回码 {rc}，将重试（尝试 {attempt}/{retries}）。")
+                    last_err = subprocess.CalledProcessError(rc, cmd)
+            except subprocess.TimeoutExpired:
+                # 主进程常驻，发送器没退出并不代表失败，这里直接认为已发送
+                print("[apply] 已发送指令（发送器未在超时时间内退出，继续）。")
+                return
+
         except Exception as e:
             last_err = e
             print(f"[apply/retry] 第 {attempt} 次异常，将在 {delay_s}s 后重试：{e}")
             time.sleep(delay_s)
+
     raise last_err if last_err else RuntimeError("apply_in_we: 未知错误")
 
 def mirror_to_projects_backup(we_exe: Path, src_item_dir: Path, wid: int) -> Optional[Path]:
@@ -1032,7 +1085,7 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         password = cfg.get("auth","steam_password",fallback=os.environ.get("STEAM_PASSWORD","")).strip() or None
         guard    = cfg.get("auth","steam_guard_code",fallback=os.environ.get("STEAM_GUARD_CODE","")).strip() or None
         if not username:
-            raise RuntimeError("请在 [auth] steam_username= 配置你的 Steam 账号")
+            raise RuntimeError("请在右键菜单登录账号")
         print(f"[login] 账号：{username}（若未提供密码/验证码将尝试用已保存凭证）")
         ok, _ = steamcmd_download_batch(steamcmd_exe, username, password, guard, [wid])
         if not ok:
@@ -1045,7 +1098,7 @@ def run_once(cfg: configparser.ConfigParser) -> str:
             state.setdefault("failed_recent", []).append(wid)
             continue
 
-        dst = official_root / str(wid)
+        dst = locate_workshop_root(cfg) / str(wid)
         print(f"[mirror] {src} -> {dst}")
         if not mirror_dir(src, dst):
             print(f"[warn] 镜像失败：{wid}；继续下一个。")
@@ -1075,7 +1128,7 @@ def run_once(cfg: configparser.ConfigParser) -> str:
 
             # 清理旧项（包 try，避免异常把 applied 变 False）
             try:
-                cleanup_all_others_if_needed(wid, cfg, steamcmd_exe, official_root, we_exe)
+                cleanup_all_others_if_needed(wid, cfg, steamcmd_exe, locate_workshop_root(cfg), we_exe)
             except Exception as e:
                 print("[cleanup] 忽略清理异常：", e)
 
@@ -1107,7 +1160,7 @@ def run_once(cfg: configparser.ConfigParser) -> str:
             state["cursor"] = min(n, cur + attempts_made)
 
     if one_per_run and (not applied) and (current_wid is not None):
-        dst_try = official_root / str(current_wid)
+        dst_try = locate_workshop_root(cfg) / str(current_wid)
         src_try = steamcmd_exe.parent / "steamapps" / "workshop" / "content" / str(APPID_WE) / str(current_wid)
         entry = find_entry(dst_try) or find_entry(src_try)
         if entry:
