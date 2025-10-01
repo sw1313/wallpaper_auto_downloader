@@ -1,38 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-we_tray.py（原生 Win32 托盘·稳定版：修复点击无响应 + 全量代码）
-
-- 原生 Shell_NotifyIcon（NOTIFYICON_VERSION_4）+ 稳定 GUID
-- 睡眠/解锁/Explorer重启：瞬时恢复托盘（TaskbarCreated / 电源恢复 / 会话解锁）
-- 左键（单击/双击）/右键菜单：已修复不响应问题
-- 单实例、Kill-on-close Job、命名事件优雅退出、worker 输出到 Tk 实时控制台
-- 自定义图标：同目录 we.ico / app.ico / tray.ico
-- 立即更换一次：触发 RUN_NOW 命名事件，唤醒现有 worker 立刻执行一轮（不重启 worker）
+we_tray.py（Win32 托盘 · 登录完善最终版 r12）
+- 逐字符读取 + 静默间隙推断
+- 启动即监控“登录阶段”，解决只打印 banner 就卡住的情况
+- 等待手机批准：使用 Tk 顶层 toast 窗口（非阻塞），在“登录成功/进入2FA”时自动销毁
+- 登录成功：显示 5s 的成功 toast，toast 消失后再重启 worker（严格顺序）
+- 行级写回 config 的 [auth].steam_username（保留注释/格式）
 """
+
 from __future__ import annotations
-import os, sys, ctypes, threading, subprocess, time, queue, hashlib, gc
+import os, sys, ctypes, threading, subprocess, time, queue, hashlib, gc, configparser, locale
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
 from uuid import UUID
+from typing import Optional
 
 # ------------------ 配置 ------------------
 WORKER_SCRIPT = "we_auto_fetch.py"
-WORKER_ARGS = []
+WORKER_ARGS: list[str] = []
 MAX_BUFFER_LINES = 5000
 
-# 仅新增 ↓↓↓（最小化修复：固定工作目录与脚本绝对路径）
+STEAMCMD_LOGIN_TIMEOUT_S = 45.0      # 登录尝试基础超时（秒）
+MOBILE_CONFIRM_MAX_WAIT_S = 60.0     # 侦测到“手机确认”后的延长等待（秒）
+MOBILE_GAP_DETECT_S = 6.0            # 静默间隙阈值（秒）
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKER_SCRIPT_ABS = (SCRIPT_DIR / WORKER_SCRIPT).resolve()
-# -----------------------------------------
 
 user32   = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 shell32  = ctypes.windll.shell32
 wtsapi32 = ctypes.windll.wtsapi32
+credui   = ctypes.windll.credui
 
-# ---- 兼容：部分 Python 没有这些 wintypes 定义，统一兜底到 HANDLE ----
+# ---- 兼容 ----
 HANDLE    = wintypes.HANDLE
 HWND      = getattr(wintypes, "HWND", HANDLE)
 HICON     = getattr(wintypes, "HICON", HANDLE)
@@ -40,8 +43,8 @@ HCURSOR   = getattr(wintypes, "HCURSOR", HANDLE)
 HBRUSH    = getattr(wintypes, "HBRUSH", HANDLE)
 HINSTANCE = getattr(wintypes, "HINSTANCE", HANDLE)
 HMENU     = getattr(wintypes, "HMENU", HANDLE)
+HBITMAP   = getattr(wintypes, "HBITMAP", HANDLE)
 
-# ---- 兼容：LRESULT/WPARAM/LPARAM 在不同版本的缺省类型 ----
 PTR_SIZE = ctypes.sizeof(ctypes.c_void_p)
 LRESULT = getattr(wintypes, "LRESULT", ctypes.c_longlong if PTR_SIZE == 8 else ctypes.c_long)
 WPARAM  = getattr(wintypes, "WPARAM",  ctypes.c_size_t)
@@ -53,7 +56,7 @@ def _errcheck_bool(result, func, args):
 
 # ------------- 常量/消息 -------------
 WM_USER               = 0x0400
-WM_TRAYICON           = WM_USER + 1       # 我们的托盘回调消息
+WM_TRAYICON           = WM_USER + 1
 WM_NULL               = 0x0000
 WM_DESTROY            = 0x0002
 WM_CLOSE              = 0x0010
@@ -66,12 +69,11 @@ WM_WTSSESSION_CHANGE  = 0x02B1
 WTS_SESSION_LOGON     = 0x0005
 WTS_SESSION_UNLOCK    = 0x0008
 NOTIFY_FOR_THIS_SESSION = 0
+WM_APP_LOGIN          = WM_USER + 100
 
-# 鼠标相关（lParam 会携带这些子消息）
-WM_LBUTTONDOWN   = 0x0201
+# 鼠标
 WM_LBUTTONUP     = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
-WM_RBUTTONDOWN   = 0x0204
 WM_RBUTTONUP     = 0x0205
 
 # 托盘
@@ -91,10 +93,11 @@ MF_STRING = 0x0000
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD   = 0x0100
 
-IDM_TOGGLE_CONSOLE   = 1001
-IDM_FORCE_SWITCH     = 1002
-IDM_TOGGLE_AUTOSTART = 1003
-IDM_EXIT             = 1004
+IDM_LOGIN           = 1000
+IDM_TOGGLE_CONSOLE  = 1001
+IDM_FORCE_SWITCH    = 1002
+IDM_TOGGLE_AUTOSTART= 1003
+IDM_EXIT            = 1004
 
 # 类样式
 CS_VREDRAW  = 0x0001
@@ -112,7 +115,7 @@ PROCESS_SET_QUOTA   = 0x0100
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JobObjectExtendedLimitInformation  = 9
 
-# ------------- 结构体与类型 -------------
+# --------- Shell / Win32 原型 ----------
 WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT, HWND, wintypes.UINT, WPARAM, LPARAM)
 
 class WNDCLASS(ctypes.Structure):
@@ -167,11 +170,9 @@ class NOTIFYICONDATAW(ctypes.Structure):
 def MAKEINTRESOURCE(i: int):
     return ctypes.cast(ctypes.c_void_p(i), wintypes.LPCWSTR)
 
-# Shell_NotifyIcon
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype  = wintypes.BOOL
 
-# 关键 API 原型（64 位安全）
 user32.RegisterClassW.errcheck   = _errcheck_bool
 user32.RegisterClassW.argtypes   = [ctypes.POINTER(WNDCLASS)]
 user32.CreateWindowExW.errcheck  = _errcheck_bool
@@ -189,8 +190,6 @@ user32.TrackPopupMenu.restype    = wintypes.UINT
 user32.GetCursorPos.argtypes     = [ctypes.POINTER(wintypes.POINT)]
 user32.SetForegroundWindow.argtypes = [HWND]
 user32.DestroyMenu.argtypes      = [HMENU]
-
-# ★ 关键：这些原型不声明会导致 64 位下 LPARAM 溢出 → 回调异常 → 点击无响应
 user32.DefWindowProcW.argtypes   = [HWND, wintypes.UINT, WPARAM, LPARAM]
 user32.DefWindowProcW.restype    = LRESULT
 user32.PostMessageW.argtypes     = [HWND, wintypes.UINT, WPARAM, LPARAM]
@@ -204,8 +203,40 @@ user32.DispatchMessageW.restype  = LRESULT
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype  = HINSTANCE
+
 wtsapi32.WTSRegisterSessionNotification.argtypes   = [HWND, wintypes.DWORD]
 wtsapi32.WTSUnRegisterSessionNotification.argtypes = [HWND]
+
+# --------- CredUI ----------
+class CREDUI_INFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize",       wintypes.DWORD),
+        ("hwndParent",   HWND),
+        ("pszMessageText", wintypes.LPCWSTR),
+        ("pszCaptionText", wintypes.LPCWSTR),
+        ("hbmBanner",    HBITMAP),
+    ]
+
+CREDUI_FLAGS_ALWAYS_SHOW_UI      = 0x80
+CREDUI_FLAGS_GENERIC_CREDENTIALS = 0x40000
+CREDUI_FLAGS_DO_NOT_PERSIST      = 0x02
+
+credui.CredUIPromptForCredentialsW.argtypes = [
+    ctypes.POINTER(CREDUI_INFO), wintypes.LPCWSTR, ctypes.c_void_p,
+    wintypes.DWORD,
+    wintypes.LPWSTR, wintypes.ULONG,
+    wintypes.LPWSTR, wintypes.ULONG,
+    ctypes.POINTER(wintypes.BOOL), wintypes.DWORD
+]
+credui.CredUIPromptForCredentialsW.restype = wintypes.DWORD
+
+ERROR_CANCELLED       = 1223
+NO_ERROR              = 0
+
+# --------- MessageBox 常量 ----------
+MB_ICONINFORMATION    = 0x40
+MB_ICONERROR          = 0x10
+MB_OK                 = 0x00000000
 
 # ----------------- 单实例 -----------------
 class SingleInstance:
@@ -254,7 +285,6 @@ def _exit_event_name() -> str:
     h = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:8]
     return f"Global\\WEAutoTrayExit_{h}"
 
-# NEW: 立即更换一次（唤醒 worker）的事件名
 def _run_now_event_name() -> str:
     try:
         base = str(Path(sys.executable).resolve())
@@ -335,7 +365,7 @@ def _assign_pid_to_job(job_handle: int, pid: int) -> bool:
     finally:
         kernel32.CloseHandle(hproc)
 
-# ----------------- Tk 实时控制台 -----------------
+# ----------------- Tk 实时控制台 + toast -----------------
 class ConsoleWindow:
     def __init__(self, title="WE - 实时控制台"):
         import tkinter as tk
@@ -349,6 +379,7 @@ class ConsoleWindow:
         self._visible = False
         self._stop_called = False
         self.title = title
+        self._toasts = {}  # key -> Toplevel
 
     def start(self):
         if self._thread and self._thread.is_alive(): return
@@ -416,6 +447,55 @@ class ConsoleWindow:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=join_timeout)
 
+    # -------- toast：可控、可自毁 --------
+    def show_toast(self, key: str, title: str, text: str, timeout_ms: Optional[int] = None):
+        def _create():
+            if key in self._toasts:
+                try: self._toasts[key].destroy()
+                except Exception: pass
+            win = self._tk.Toplevel(self.root)
+            win.title(title)
+            try:
+                win.overrideredirect(True)
+            except Exception:
+                pass
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+            # 内容
+            frm = self._tk.Frame(win, bd=1, relief="solid")
+            frm.pack(fill="both", expand=True)
+            lbl_title = self._tk.Label(frm, text=title, font=("Segoe UI", 10, "bold"))
+            lbl_title.pack(anchor="w", padx=12, pady=(10, 2))
+            lbl_text = self._tk.Label(frm, text=text, wraplength=360, justify="left")
+            lbl_text.pack(anchor="w", padx=12, pady=(0, 10))
+            # 位置：右下角
+            win.update_idletasks()
+            w = win.winfo_reqwidth()
+            h = win.winfo_reqheight()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            x = max(0, sw - w - 16)
+            y = max(0, sh - h - 48)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            # 点击即关闭
+            win.bind("<Button-1>", lambda e: self.close_toast(key))
+            self._toasts[key] = win
+            if timeout_ms and timeout_ms > 0:
+                win.after(timeout_ms, lambda: self.close_toast(key))
+        if self.root:
+            self.root.after(0, _create)
+
+    def close_toast(self, key: str):
+        def _close():
+            win = self._toasts.pop(key, None)
+            if win:
+                try: win.destroy()
+                except Exception: pass
+        if self.root:
+            self.root.after(0, _close)
+
 # ----------------- worker 进程 -----------------
 @dataclass
 class WorkerProc:
@@ -435,15 +515,10 @@ def _win_hidden_popen_kwargs():
 
 def start_worker_and_reader(console: ConsoleWindow, job_handle: int | None = None) -> WorkerProc:
     exe = sys.executable
-
-    # 仅最小化修改：绝对路径 + 固定工作目录为脚本目录
     if getattr(sys, "frozen", False):
         cmd = [exe, "--worker", *WORKER_ARGS]
     else:
         cmd = [exe, "-u", str(WORKER_SCRIPT_ABS), *WORKER_ARGS]
-
-    safe_cwd = SCRIPT_DIR  # 关键：不再用用户主目录/临时目录
-
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -451,10 +526,9 @@ def start_worker_and_reader(console: ConsoleWindow, job_handle: int | None = Non
         bufsize=1,
         universal_newlines=True,
         close_fds=True,
-        cwd=str(safe_cwd),
+        cwd=str(SCRIPT_DIR),
         **_win_hidden_popen_kwargs()
     )
-
     if job_handle:
         try: _assign_pid_to_job(job_handle, p.pid)
         except Exception: pass
@@ -525,7 +599,6 @@ def run_worker_inline():
     try: sys.stdout.reconfigure(line_buffering=True)
     except Exception: pass
     _start_worker_exit_watcher_thread()
-
     base = Path(sys.argv[0]).resolve().parent
     sys.path.insert(0, str(base))
     try:
@@ -544,6 +617,75 @@ def run_worker_inline():
         except Exception: pass
         time.sleep(0.5)
 
+# ----------------- ini 写入（保留注释/格式） -----------------
+def _ini_set_key_preserve_comments(path: Path, section: str, key: str, value: str):
+    section_l = section.strip().lower()
+    key_l = key.strip().lower()
+
+    orig = ""
+    if path.exists():
+        orig = path.read_text(encoding="utf-8", errors="ignore")
+    newline = "\r\n" if "\r\n" in orig else "\n"
+    lines = orig.splitlines()
+
+    if not lines:
+        text = [
+            "# Auto-generated config (comments preserved on future updates)",
+            f"[{section}]",
+            f"{key} = {value}",
+            ""
+        ]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline=newline) as f:
+            f.write(newline.join(text))
+        return
+
+    sec_start, sec_end = None, None
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("[") and s.endswith("]"):
+            name = s[1:-1].strip().lower()
+            if name == section_l:
+                sec_start = i
+                for j in range(i + 1, len(lines)):
+                    s2 = lines[j].strip()
+                    if s2.startswith("[") and s2.endswith("]"):
+                        sec_end = j
+                        break
+                if sec_end is None:
+                    sec_end = len(lines)
+                break
+
+    if sec_start is None:
+        insert = [f"[{section}]", f"{key} = {value}"]
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.extend(insert)
+        with open(path, "w", encoding="utf-8", newline=newline) as f:
+            f.write(newline.join(lines) + newline)
+        return
+
+    key_line_idx = None
+    for i in range(sec_start + 1, sec_end):
+        raw = lines[i]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+            continue
+        if "=" in stripped:
+            k = stripped.split("=", 1)[0].strip().lower()
+            if k == key_l:
+                key_line_idx = i
+                break
+
+    if key_line_idx is not None:
+        leading_ws = lines[key_line_idx][:len(lines[key_line_idx]) - len(lines[key_line_idx].lstrip())]
+        lines[key_line_idx] = f"{leading_ws}{key} = {value}"
+    else:
+        lines.insert(sec_end, f"{key} = {value}")
+
+    with open(path, "w", encoding="utf-8", newline=newline) as f:
+        f.write(newline.join(lines) + newline)
+
 # ----------------- 原生 Win32 托盘 APP -----------------
 class Win32TrayApp:
     def __init__(self):
@@ -552,7 +694,6 @@ class Win32TrayApp:
         self._exit_evt_name = _exit_event_name()
         self._exit_evt = _create_named_event_manual_reset(self._exit_evt_name, initial=False)
 
-        # NEW: RUN_NOW 事件，用于“立即更换一次”
         self._run_now_evt_name = _run_now_event_name()
         self._run_now_evt = _open_named_event(self._run_now_evt_name) or _create_named_event_manual_reset(self._run_now_evt_name, initial=False)
 
@@ -567,16 +708,17 @@ class Win32TrayApp:
 
         self.class_name = "WEAutoTrayWin32HiddenWindow"
         self.tip_text = "WE Auto Runner - 正在运行"
-
-        # 保存回调，防止被 GC
         self._wndproc = None
 
-        # LoadImageW 原型（为自定义 .ico）
+        # 手机确认 toast 控制
+        self._mobile_prompt_shown = False
+        self._mobile_prompt_lock = threading.Lock()
+
         user32.LoadImageW.argtypes = [HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
                                       ctypes.c_int, ctypes.c_int, wintypes.UINT]
         user32.LoadImageW.restype = HANDLE
 
-    # --- GUID 基于 exe 路径稳定生成 ---
+    # ---------- Utilities ----------
     def _make_guid_from_exe(self) -> GUID:
         try:
             base = str(Path(sys.executable).resolve())
@@ -586,7 +728,6 @@ class Win32TrayApp:
         u = UUID(h[:32])
         return GUID.from_uuid(u)
 
-    # --- 托盘核心 ---
     def _notify(self, msg, data: NOTIFYICONDATAW):
         return bool(shell32.Shell_NotifyIconW(msg, ctypes.byref(data)))
 
@@ -594,7 +735,7 @@ class Win32TrayApp:
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd
-        nid.uID = 0  # 使用 GUID 管理，uID 可置 0
+        nid.uID = 0
         nid.uFlags = flags
         nid.uCallbackMessage = WM_TRAYICON
         nid.hIcon = hicon or self.hicon
@@ -626,81 +767,445 @@ class Win32TrayApp:
         self.added = False
         self.console.append("[tray] 托盘图标已删除。")
 
-    # --- 自定义图标加载（we.ico / app.ico / tray.ico）→ 退回系统图标 ---
     def _load_icon(self):
         IMAGE_ICON      = 1
         LR_LOADFROMFILE = 0x00000010
         LR_DEFAULTSIZE  = 0x00000040
-
-        candidates = ["we.ico", "app.ico", "tray.ico"]
-        for name in candidates:
+        for name in ["we.ico", "app.ico", "tray.ico"]:
             p = Path(__file__).with_name(name)
             if p.exists():
                 h = user32.LoadImageW(None, str(p), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
                 if h:
                     self.console.append(f"[tray] 已加载自定义图标：{p.name}")
                     return HICON(h)
-
         IDI_APPLICATION = 32512
         self.console.append("[tray] 未找到自定义图标，使用系统图标。")
         return user32.LoadIconW(None, MAKEINTRESOURCE(IDI_APPLICATION))
 
-    # --- 右键菜单 ---
+    # ---------- 右键菜单 ----------
     def _show_context_menu(self):
         hMenu = user32.CreatePopupMenu()
         autostart_txt = "关闭开机自启" if is_autostart_enabled() else "开启开机自启"
+        user32.AppendMenuW(hMenu, MF_STRING, IDM_LOGIN, "登录账号...")
         user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_CONSOLE, "打开/隐藏 控制台")
-        # 文案更新：不再重启 worker
         user32.AppendMenuW(hMenu, MF_STRING, IDM_FORCE_SWITCH, "立即更换一次")
         user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_AUTOSTART, autostart_txt)
         user32.AppendMenuW(hMenu, MF_STRING, IDM_EXIT, "退出")
-
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         user32.SetForegroundWindow(self.hwnd)
         cmd = user32.TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, self.hwnd, None)
-        # 关闭菜单的常见技巧（防止菜单“粘住”）
         user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
         if cmd:
             user32.PostMessageW(self.hwnd, WM_COMMAND, cmd, 0)
         user32.DestroyMenu(hMenu)
 
-    # --- 命令处理 ---
-    def _on_cmd(self, cmd):
-        if cmd == IDM_TOGGLE_CONSOLE:
-            self.console.toggle()
-        elif cmd == IDM_FORCE_SWITCH:
-            # 新逻辑：仅触发 RUN_NOW 事件，不重启 worker
-            self.console.append("[action] 立即更换一次：已通知 worker 立刻执行一轮。")
-            try:
-                _set_event(self._run_now_evt)
-            except Exception:
-                self.console.append("[action] 通知失败：RUN_NOW 事件句柄无效。")
-        elif cmd == IDM_TOGGLE_AUTOSTART:
-            cur = is_autostart_enabled()
-            set_autostart(not cur)
-            self.console.append(f"[autostart] 已设置开机自启 = {not cur}")
-            self._modify_icon()
-        elif cmd == IDM_EXIT:
-            self._exit_app()
+    # ---------- 简易 MsgBox（仅报错） ----------
+    def _msgbox(self, title: str, text: str, flags: int) -> int:
+        return user32.MessageBoxW(self.hwnd, text, title, flags)
 
-    # --- worker 优雅退出 ---
-    def _signal_worker_exit_and_wait(self, wait_s: float = 3.0):
+    def _msg_error(self, title: str, text: str):
+        self._msgbox(title, text, MB_ICONERROR | MB_OK)
+
+    # ---------- CredUI（账号/密码/验证码输入） ----------
+    def _cred_prompt(self, caption: str, message: str, target: str,
+                     default_user: str = "") -> Optional[tuple[str, str]]:
+        ui = CREDUI_INFO()
+        ui.cbSize = ctypes.sizeof(CREDUI_INFO)
+        ui.hwndParent = self.hwnd
+        ui.pszMessageText = message
+        ui.pszCaptionText = caption
+        ui.hbmBanner = None
+
+        user_buf = ctypes.create_unicode_buffer(default_user or "", 256)
+        pass_buf = ctypes.create_unicode_buffer(256)
+        save = wintypes.BOOL(False)
+        flags = (CREDUI_FLAGS_ALWAYS_SHOW_UI |
+                 CREDUI_FLAGS_GENERIC_CREDENTIALS |
+                 CREDUI_FLAGS_DO_NOT_PERSIST)
+
+        rc = credui.CredUIPromptForCredentialsW(
+            ctypes.byref(ui), target, None, 0,
+            user_buf, ctypes.sizeof(user_buf) // ctypes.sizeof(wintypes.WCHAR),
+            pass_buf, ctypes.sizeof(pass_buf) // ctypes.sizeof(wintypes.WCHAR),
+            ctypes.byref(save), flags
+        )
+        if rc == ERROR_CANCELLED:
+            return None
+        if rc != NO_ERROR:
+            try:
+                raise ctypes.WinError(rc)
+            except Exception as e:
+                self.console.append(f"[login] CredUI 错误：{e}")
+                self._msg_error("登录", f"无法显示凭据对话框：{e}")
+            return None
+        return (user_buf.value, pass_buf.value)
+
+    # ---------- 配置 ----------
+    def _config_candidates(self):
+        names = ("config", "config.ini")
+        out = []
+        env_p = os.environ.get("WE_CONFIG") or os.environ.get("WE_CONF")
+        if env_p: out.append(Path(env_p))
+        base = SCRIPT_DIR
+        out += [base / n for n in names]
+        cwd = Path.cwd()
+        if cwd != base:
+            out += [cwd / n for n in names]
+        mei = getattr(sys, "_MEIPASS", None)
+        if mei:
+            m = Path(mei)
+            out += [m / n for n in names]
+        seen, uniq = set(), []
+        for p in out:
+            rp = p.resolve()
+            if rp not in seen:
+                uniq.append(rp); seen.add(rp)
+        return uniq
+
+    def _load_config_path(self) -> Path:
+        for p in self._config_candidates():
+            if p.exists():
+                return p
+        return (SCRIPT_DIR / "config").resolve()
+
+    def _load_cfg_readonly(self) -> tuple[configparser.ConfigParser, Path]:
+        path = self._load_config_path()
+        cfg = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",))
+        if path.exists():
+            cfg.read(path, encoding="utf-8")
+        return cfg, path
+
+    def _save_username_to_cfg_preserve(self, username: str):
+        _, path = self._load_cfg_readonly()
+        _ini_set_key_preserve_comments(path, "auth", "steam_username", username)
+        self.console.append(f"[login] 已写入配置 {path.name} [auth].steam_username={username}（保留注释）")
+
+    def _get_steamcmd_from_cfg(self) -> Optional[Path]:
+        cfg, _ = self._load_cfg_readonly()
+        steamcmd = (cfg.get("paths", "steamcmd", fallback="") or "").strip()
+        if not steamcmd:
+            return None
+        p = Path(steamcmd)
+        return p if p.exists() else None
+
+    # ---------- 验证码规范化 ----------
+    def _normalize_guard_code(self, code: str) -> str:
+        code = (code or "").strip().replace(" ", "").replace("-", "")
+        return code.upper()
+
+    # ---------- 输出解析 ----------
+    @staticmethod
+    def _contains_any(text: str, keywords: list[str]) -> bool:
+        return any(k in text for k in keywords)
+
+    def _parse_login_outcome(self, out_low: str) -> dict:
+        success_kw = [
+            "logged in ok", "logged in", "logged on",
+            "waiting for client config...ok",
+            "waiting for user info...ok",
+            "登录成功", "已登录", "已登入", "登錄成功"
+        ]
+        invalid_pw_kw = [
+            "invalid password", "incorrect password",
+            "错误的帐户名或密码", "密码错误", "密碼錯誤", "口令错误", "口令錯誤"
+        ]
+        guard_kw = [
+            "two-factor","two factor","steam guard","authenticator","enter the current code",
+            "guard code","2fa","verification code","verify code","auth code",
+            "验证码","驗證碼","验证代码","驗證代碼","二次验证","兩步驗證","双重验证","双重身份验证",
+            "手机令牌","輸入當前","请输入当前"
+        ]
+        mobile_kw = [
+            "waiting for confirmation","waiting for your confirmation","mobile app",
+            "在手机上确认","在手機上確認","请在手机上确认","請在手機上確認","等待您在手机上确认",
+            "在移动设备上批准","在移動設備上批准","手机确认","手機確認","移动端确认","移動端確認","批准","同意"
+        ]
+
+        success = self._contains_any(out_low, success_kw)
+        if ("logging in user" in out_low) and ("to steam public...ok" in out_low):
+            success = True
+
+        return dict(
+            success=success,
+            invalid_pw=self._contains_any(out_low, invalid_pw_kw),
+            need_guard=self._contains_any(out_low, guard_kw),
+            need_mobile_confirm=self._contains_any(out_low, mobile_kw),
+        )
+
+    # ---------- 登录一次（逐字符读取 + 静默间隙推断；启动即监控） ----------
+    def _steamcmd_login_once(self, steamcmd_exe: Path, username: str, password: Optional[str], guard: Optional[str]) -> tuple[bool, str, dict, bool]:
+        args = []
+        if guard:
+            guard = self._normalize_guard_code(guard)
+            args += ["+login", username, password or "", guard]
+        else:
+            if password: args += ["+login", username, password]
+            else:        args += ["+login", username]
+        args += ["+quit"]
+
+        self.console.append("[login] 正在尝试登录 Steam（仅登录，不下载）...")
+
+        p = subprocess.Popen(
+            [str(steamcmd_exe), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+
+        enc = "mbcs" if os.name == "nt" else (locale.getpreferredencoding(False) or "utf-8")
+
+        timed_out = {"v": False}
+        finished = {"v": False}
+
+        def _on_timeout():
+            if p.poll() is None:
+                timed_out["v"] = True
+                try:
+                    self.console.append("[login] 登录等待超时，结束 steamcmd（很可能在等待手机确认或 2FA）。")
+                    p.terminate()
+                except Exception:
+                    try: p.kill()
+                    except Exception: pass
+
+        # 总超时计时器
+        timer = [None]
+        def _start_timer(seconds: float):
+            if timer[0] is not None:
+                try: timer[0].cancel()
+                except Exception: pass
+            t = threading.Timer(seconds, _on_timeout)
+            t.start()
+            timer[0] = t
+
+        _start_timer(STEAMCMD_LOGIN_TIMEOUT_S)
+
+        all_bytes = bytearray()
+        last_activity_ts = time.time()
+        login_phase_started = {"v": True}   # 启动即视为“登录阶段”
+        mobile_hint_shown = {"v": False}
+
+        # 静默间隙看门狗：提示“请在手机上确认”
+        def _gap_watchdog():
+            nonlocal last_activity_ts
+            while not finished["v"] and p.poll() is None:
+                time.sleep(0.5)
+                if mobile_hint_shown["v"]:
+                    continue
+                if not login_phase_started["v"]:
+                    continue
+                gap = time.time() - last_activity_ts
+                if gap >= MOBILE_GAP_DETECT_S:
+                    with self._mobile_prompt_lock:
+                        if not self._mobile_prompt_shown:
+                            self._mobile_prompt_shown = True
+                            mobile_hint_shown["v"] = True
+                            self.console.append(f"[login] {gap:.1f}s 无新输出，推断在等待手机确认，延长等待 {int(MOBILE_CONFIRM_MAX_WAIT_S)}s。")
+                            # toast（可被后续事件主动关闭）
+                            self.console.show_toast(
+                                key="mobile_confirm",
+                                title="请在手机上确认",
+                                text=f"正在等待你在手机端批准这次登录。\n本轮等待已延长至 {int(MOBILE_CONFIRM_MAX_WAIT_S)} 秒。",
+                                timeout_ms=int(MOBILE_CONFIRM_MAX_WAIT_S * 1000)
+                            )
+                            _start_timer(MOBILE_CONFIRM_MAX_WAIT_S)
+                    last_activity_ts = time.time()
+            with self._mobile_prompt_lock:
+                self._mobile_prompt_shown = False
+                # 结束时保险收尾
+                self.console.close_toast("mobile_confirm")
+
+        threading.Thread(target=_gap_watchdog, daemon=True).start()
+
+        # 逐字符读取
         try:
-            _set_event(self._exit_evt)
+            assert p.stdout is not None
+            line_buf = bytearray()
+            while True:
+                b = p.stdout.read(1)
+                if not b:
+                    break
+                all_bytes.extend(b)
+                line_buf.extend(b)
+                last_activity_ts = time.time()
+
+                try:
+                    all_text = all_bytes.decode(enc, errors="ignore")
+                except Exception:
+                    all_text = all_bytes.decode("utf-8", errors="ignore")
+                low = all_text.lower()
+
+                # 直接关键字命中“等待确认” → toast
+                if (not mobile_hint_shown["v"]) and (
+                    ("waiting for confirmation" in low) or
+                    ("waiting for your confirmation" in low) or
+                    ("请在手机上确认" in all_text) or
+                    ("在手机上确认" in all_text) or
+                    ("在移动设备上批准" in all_text)
+                ):
+                    with self._mobile_prompt_lock:
+                        if not self._mobile_prompt_shown:
+                            self._mobile_prompt_shown = True
+                            mobile_hint_shown["v"] = True
+                            self.console.append("[login] 侦测到“等待手机确认”关键字，延长等待并显示提示。")
+                            self.console.show_toast(
+                                key="mobile_confirm",
+                                title="请在手机上确认",
+                                text=f"账号开启手机确认：请在 Steam App/令牌中批准本次登录。\n本轮等待已延长至 {int(MOBILE_CONFIRM_MAX_WAIT_S)} 秒。",
+                                timeout_ms=int(MOBILE_CONFIRM_MAX_WAIT_S * 1000)
+                            )
+                            _start_timer(MOBILE_CONFIRM_MAX_WAIT_S)
+
+                # 行回显
+                if b in (b"\n", b"\r") and line_buf:
+                    try:
+                        self.console.append(line_buf.decode(enc, errors="ignore").rstrip("\r\n"))
+                    except Exception:
+                        self.console.append(line_buf.decode("utf-8", errors="ignore").rstrip("\r\n"))
+                    line_buf.clear()
+
+            # 残留半行
+            if line_buf:
+                try:
+                    self.console.append(line_buf.decode(enc, errors="ignore"))
+                except Exception:
+                    self.console.append(line_buf.decode("utf-8", errors="ignore"))
+                line_buf.clear()
+
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try: p.kill()
+                except Exception: pass
+        finally:
+            finished["v"] = True
+            try:
+                if timer[0] is not None:
+                    timer[0].cancel()
+            except Exception:
+                pass
+            with self._mobile_prompt_lock:
+                self._mobile_prompt_shown = False
+            # 保险清理
+            self.console.close_toast("mobile_confirm")
+
+        try:
+            out = all_bytes.decode(enc, errors="ignore")
+        except Exception:
+            out = all_bytes.decode("utf-8", errors="ignore")
+        low = out.lower()
+        flags = self._parse_login_outcome(low)
+
+        ok = (p.returncode == 0 and flags["success"])
+        if timed_out["v"] and not flags["invalid_pw"]:
+            flags.setdefault("maybe_waiting_mobile", True)
+
+        return ok, out, flags, timed_out["v"]
+
+    def _restart_worker_after_success_toast(self):
+        # 成功 toast 5s 后再重启 worker
+        self.console.show_toast(
+            key="login_success",
+            title="登录成功",
+            text="账号登录成功，已记录至配置。\n即将应用新账号并重启 worker …",
+            timeout_ms=5000
+        )
+        def _do():
+            # toast 消失后再执行
+            self.console.close_toast("login_success")
+            self._restart_worker()
+        threading.Timer(5.1, _do).start()
+
+    def _restart_worker(self):
+        try:
+            self.console.append("[login] 正在重启 worker 以应用新账号 ...")
+            self._signal_worker_exit_and_wait(wait_s=2.5)
         except Exception:
             pass
+        try:
+            self.wp = start_worker_and_reader(self.console, job_handle=self._job)
+            self.console.append("[login] worker 已重启。")
+        except Exception as e:
+            self.console.append(f"[login] 重启 worker 失败：{e}")
+
+    # ---------- 登录主流程 ----------
+    def _login_flow_wincred(self):
+        steamcmd = self._get_steamcmd_from_cfg()
+        if not steamcmd:
+            self._msg_error("登录", "缺少 steamcmd 路径：请先在配置 [paths] 中设置 steamcmd= 的绝对路径。")
+            return
+
+        username: str = ""
+        for _ in range(3):
+            cred = self._cred_prompt(
+                caption="登录 Steam 账号",
+                message="请输入 Steam 账号与密码。\n（密码不会被保存，仅用于本次登录）",
+                target="steam://login",
+                default_user=username
+            )
+            if not cred:
+                self.console.append("[login] 用户取消了账号输入。"); return
+            username, password = cred
+
+            ok, out, flags, timed_out = self._steamcmd_login_once(steamcmd, username, password, guard=None)
+
+            if flags.get("invalid_pw"):
+                self._msg_error("登录失败", "密码不正确，请重新输入。")
+                continue
+
+            if ok:
+                # 成功 → 关闭“手机确认”toast → 展示成功 toast（5s）→ toast 后重启 worker
+                self.console.close_toast("mobile_confirm")
+                try: self._save_username_to_cfg_preserve(username)
+                except Exception as e: self.console.append(f"[login] 写入配置失败：{e}")
+                self._restart_worker_after_success_toast()
+                return
+
+            if flags.get("need_mobile_confirm") or flags.get("maybe_waiting_mobile") or timed_out:
+                self.console.append("[login] 手机确认等待未完成，转入 2FA 验证码流程。")
+
+            # 进入 2FA 前关闭“手机确认”toast
+            self.console.close_toast("mobile_confirm")
+
+            for _try in range(3):
+                cred2 = self._cred_prompt(
+                    caption="输入 2FA 验证码",
+                    message=("此账号开启了 Steam Guard 二次验证。\n"
+                             "请在“密码”一栏输入 **5 位**（或 **6 位**）验证码；不区分大小写，可直接输入。"),
+                    target="steam://guard",
+                    default_user=username
+                )
+                if not cred2:
+                    self.console.append("[login] 用户取消了手机令牌输入。"); break
+                _, guard = cred2
+                ok2, out2, flags2, _ = self._steamcmd_login_once(steamcmd, username, password, guard=guard)
+                if flags2.get("invalid_pw"):
+                    self._msg_error("登录失败", "密码已失效或被修改，请返回重输密码。")
+                    break
+                if ok2:
+                    self.console.close_toast("mobile_confirm")
+                    try: self._save_username_to_cfg_preserve(username)
+                    except Exception as e: self.console.append(f"[login] 写入配置失败：{e}")
+                    self._restart_worker_after_success_toast()
+                    return
+                self._msg_error("登录失败", "验证码/令牌无效或登录失败，请重试。")
+            continue
+
+        self._msg_error("登录失败", "多次尝试未成功。请检查账号/密码/验证码后再试。")
+
+    # ---------- 退出/消息循环 ----------
+    def _signal_worker_exit_and_wait(self, wait_s: float = 3.0):
+        try: _set_event(self._exit_evt)
+        except Exception: pass
         t0 = time.time()
         try:
             if self.wp and self.wp.proc:
                 while self.wp.proc.poll() is None and (time.time() - t0) < wait_s:
                     time.sleep(0.05)
-        except Exception:
-            pass
+        except Exception: pass
         if self.wp and self.wp.proc and self.wp.proc.poll() is None:
             stop_worker(self.wp, timeout=2.0)
 
-    # --- 退出清理 ---
     def _exit_app(self):
         self.console.append("[exit] 正在优雅退出...")
         try: self._delete_icon()
@@ -709,7 +1214,8 @@ class Win32TrayApp:
             self._signal_worker_exit_and_wait(wait_s=3.0)
             self.console.append("[exit] worker 已停止（或将被 Job 回收）。")
         except Exception: pass
-        try: self.console.stop()
+        try:
+            self.console.stop()
         except Exception: pass
         try:
             meipass = getattr(sys, "_MEIPASS", "")
@@ -729,21 +1235,34 @@ class Win32TrayApp:
         finally:
             user32.PostQuitMessage(0)
 
-    # --- WindowProc ---
+    def _on_cmd(self, cmd):
+        if cmd == IDM_LOGIN:
+            user32.PostMessageW(self.hwnd, WM_APP_LOGIN, 0, 0); return
+        if cmd == IDM_TOGGLE_CONSOLE:
+            self.console.toggle()
+        elif cmd == IDM_FORCE_SWITCH:
+            self.console.append("[action] 立即更换一次：已通知 worker 立刻执行一轮。")
+            try: _set_event(self._run_now_evt)
+            except Exception:
+                self.console.append("[action] 通知失败：RUN_NOW 事件句柄无效。")
+        elif cmd == IDM_TOGGLE_AUTOSTART:
+            cur = is_autostart_enabled()
+            set_autostart(not cur)
+            self.console.append(f"[autostart] 已设置开机自启 = {not cur}")
+            self._modify_icon()
+        elif cmd == IDM_EXIT:
+            self._exit_app()
+
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         if msg == self._taskbar_created_msg:
             self.console.append("[tray] 收到 TaskbarCreated，重加托盘。")
-            self._add_icon()
-            return 0
+            self._add_icon(); return 0
 
         if msg == WM_TRAYICON:
-            # 规范化为无符号 32 位（避免 ctypes 有符号解释）
             sub = int(lparam) & 0xFFFFFFFF
-            # 左键：单击/双击 都打开/切换控制台
             if sub in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
                 self.console.toggle(); return 0
-            # 右键：弹出菜单（两种路径都支持）
-            if sub in (WM_RBUTTONUP, WM_CONTEXTMENU):
+            if sub == WM_RBUTTONUP:
                 self._show_context_menu(); return 0
             return 0
 
@@ -758,6 +1277,10 @@ class Win32TrayApp:
         if msg == WM_COMMAND:
             self._on_cmd(wparam & 0xFFFF); return 0
 
+        if msg == WM_APP_LOGIN:
+            threading.Thread(target=self._login_flow_wincred, daemon=True).start()
+            return 0
+
         if msg == WM_DESTROY:
             self._delete_icon()
             user32.PostQuitMessage(0); return 0
@@ -767,12 +1290,11 @@ class Win32TrayApp:
 
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-    # --- 创建隐藏窗口 + 消息循环 ---
     def run(self):
         def _proc(hwnd, msg, wparam, lparam):
             return self._wnd_proc(hwnd, msg, wparam, lparam)
         wndproc = WNDPROCTYPE(_proc)
-        self._wndproc = wndproc  # 持有引用防 GC
+        self._wndproc = wndproc
 
         hinst = kernel32.GetModuleHandleW(None)
         wc = WNDCLASS()
@@ -799,7 +1321,6 @@ class Win32TrayApp:
 
         self._add_icon()
 
-        # ★ 关键：不过滤窗口，保证线程队列里的所有消息都能收到
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
             user32.TranslateMessage(ctypes.byref(msg))
@@ -812,11 +1333,9 @@ class Win32TrayApp:
 def main():
     if "--worker" in sys.argv:
         run_worker_inline(); return
-
     si = SingleInstance("WEAutoTrayMutex")
     if si.already_running:
         return
-
     app = Win32TrayApp()
     try:
         app.run()
