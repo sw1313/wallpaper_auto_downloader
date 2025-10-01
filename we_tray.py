@@ -7,6 +7,7 @@ we_tray.py（原生 Win32 托盘·稳定版：修复点击无响应 + 全量代�
 - 左键（单击/双击）/右键菜单：已修复不响应问题
 - 单实例、Kill-on-close Job、命名事件优雅退出、worker 输出到 Tk 实时控制台
 - 自定义图标：同目录 we.ico / app.ico / tray.ico
+- 立即更换一次：触发 RUN_NOW 命名事件，唤醒现有 worker 立刻执行一轮（不重启 worker）
 """
 from __future__ import annotations
 import os, sys, ctypes, threading, subprocess, time, queue, hashlib, gc
@@ -252,6 +253,15 @@ def _exit_event_name() -> str:
         base = sys.argv[0]
     h = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:8]
     return f"Global\\WEAutoTrayExit_{h}"
+
+# NEW: 立即更换一次（唤醒 worker）的事件名
+def _run_now_event_name() -> str:
+    try:
+        base = str(Path(sys.executable).resolve())
+    except Exception:
+        base = sys.argv[0]
+    h = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:8]
+    return f"Global\\WEAutoTrayRunNow_{h}"
 
 def _create_named_event_manual_reset(name: str, initial: bool=False):
     return kernel32.CreateEventW(None, True, bool(initial), name)
@@ -542,6 +552,10 @@ class Win32TrayApp:
         self._exit_evt_name = _exit_event_name()
         self._exit_evt = _create_named_event_manual_reset(self._exit_evt_name, initial=False)
 
+        # NEW: RUN_NOW 事件，用于“立即更换一次”
+        self._run_now_evt_name = _run_now_event_name()
+        self._run_now_evt = _open_named_event(self._run_now_evt_name) or _create_named_event_manual_reset(self._run_now_evt_name, initial=False)
+
         self._job = _create_kill_on_close_job()
         self.wp = start_worker_and_reader(self.console, job_handle=self._job)
 
@@ -636,7 +650,8 @@ class Win32TrayApp:
         hMenu = user32.CreatePopupMenu()
         autostart_txt = "关闭开机自启" if is_autostart_enabled() else "开启开机自启"
         user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_CONSOLE, "打开/隐藏 控制台")
-        user32.AppendMenuW(hMenu, MF_STRING, IDM_FORCE_SWITCH, "立即更换（重启一次）")
+        # 文案更新：不再重启 worker
+        user32.AppendMenuW(hMenu, MF_STRING, IDM_FORCE_SWITCH, "立即更换一次")
         user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_AUTOSTART, autostart_txt)
         user32.AppendMenuW(hMenu, MF_STRING, IDM_EXIT, "退出")
 
@@ -655,10 +670,12 @@ class Win32TrayApp:
         if cmd == IDM_TOGGLE_CONSOLE:
             self.console.toggle()
         elif cmd == IDM_FORCE_SWITCH:
-            self.console.append("[action] 立即更换：正在重启 worker...")
-            self._signal_worker_exit_and_wait(2.0)
-            self.wp = start_worker_and_reader(self.console, job_handle=self._job)
-            self.console.append("[action] 已重启 worker。")
+            # 新逻辑：仅触发 RUN_NOW 事件，不重启 worker
+            self.console.append("[action] 立即更换一次：已通知 worker 立刻执行一轮。")
+            try:
+                _set_event(self._run_now_evt)
+            except Exception:
+                self.console.append("[action] 通知失败：RUN_NOW 事件句柄无效。")
         elif cmd == IDM_TOGGLE_AUTOSTART:
             cur = is_autostart_enabled()
             set_autostart(not cur)

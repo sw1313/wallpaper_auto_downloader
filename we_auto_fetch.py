@@ -5,59 +5,52 @@ we_auto_fetch.py — Web API(steam api_key) 拉已排序/筛选列表 → 每轮
 → one_per_run 清理（不重写日志，长期去重）
 
 依赖：pip install requests
+
+改动要点（2025-09-30）：
+- 年龄分级以普通 tags 为主（Everyone / Questionable / Mature），KV 仅兜底
+- types 也是普通 tag（Scene / Video / Web / Application / …）
+- 当 age 或 types 只配置单个值时，推入 WebAPI/HTML 的 requiredtags 做服务端筛选；
+  多选时在客户端用 OR 过滤，避免服务端 AND 筛成 0。
+
+改动要点（2025-10-01）：
+- 新增 RUN_NOW 命名事件：允许托盘/外部唤醒本进程，立刻执行一轮 run_once（不重启 worker）。
+- 新增命令行 --once：读取配置并仅执行一轮 run_once 后退出。
 """
 
 from __future__ import annotations
-import configparser, json, os, re, shutil, subprocess, sys, time, io
+import configparser, json, os, re, shutil, subprocess, sys, time, io, ctypes, hashlib
+from ctypes import wintypes
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 APPID_WE = 431960
 
 # =========================
-# 修 复 ：配置与路径解析
+# 配置与路径解析
 # =========================
 def _app_root() -> Path:
-    """
-    - PyInstaller 打包：返回 exe 所在目录
-    - 源码运行：返回当前文件所在目录
-    """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
-HERE = _app_root()          # 供日志/状态文件等使用（稳定，不再指向 _MEI 临时目录）
-CONF_PATH = None            # 不再在导入期固定；read_conf() 会动态查找
+HERE = _app_root()
+CONF_PATH = None
 
 def _candidate_config_paths() -> list[Path]:
-    """
-    返回按优先级排列的候选配置路径（允许 'config' 或 'config.ini'）
-    优先级：环境变量 → 程序目录 → 当前工作目录 → _MEIPASS（若存在）
-    """
     names = ("config", "config.ini")
     out: list[Path] = []
-
-    # 1) 显式环境变量
     env_p = os.environ.get("WE_CONFIG") or os.environ.get("WE_CONF")
     if env_p:
         out.append(Path(env_p))
-
-    # 2) 程序目录（exe 同目录 / 源码当前文件目录）
     base = _app_root()
     out += [base / n for n in names]
-
-    # 3) 当前工作目录
     cwd = Path.cwd()
     if cwd != base:
         out += [cwd / n for n in names]
-
-    # 4) PyInstaller 临时目录（如果你把 config 打进包里）
     mei = getattr(sys, "_MEIPASS", None)
     if mei:
         m = Path(mei)
         out += [m / n for n in names]
-
-    # 去重 + 规范化
     seen, uniq = set(), []
     for p in out:
         rp = p.resolve()
@@ -95,31 +88,18 @@ def parse_interval(s: str) -> int:
 def now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
-def _safe_decode_bytes(b: bytes) -> str:
-    for enc in ("utf-8", "cp1252", "gbk"):
-        try:
-            return b.decode(enc, errors="ignore")
-        except Exception:
-            continue
-    return b.decode("latin-1", errors="ignore")
-
 def _safe_int(x, default=0) -> int:
-    """宽容地把各种类型/空串转成 int，失败返回 default。"""
     try:
-        if isinstance(x, bool):
-            return int(x)
-        if isinstance(x, (int, float)):
-            return int(x)
+        if isinstance(x, bool): return int(x)
+        if isinstance(x, (int, float)): return int(x)
         s = str(x).strip()
         return int(s) if s else default
     except Exception:
         return default
 
 def _cfg_int(cfg: configparser.ConfigParser, section: str, option: str, fallback: int) -> int:
-    """更稳健的 getint：值缺失、为空或非法一律返回 fallback。"""
     try:
-        if not cfg.has_option(section, option):
-            return fallback
+        if not cfg.has_option(section, option): return fallback
         raw = cfg.get(section, option)
         s = "" if raw is None else str(raw).strip()
         return int(s) if s else fallback
@@ -127,18 +107,14 @@ def _cfg_int(cfg: configparser.ConfigParser, section: str, option: str, fallback
         return fallback
 
 def _cfg_bool(cfg: configparser.ConfigParser, section: str, option: str, fallback: bool) -> bool:
-    """更稳健的 getboolean：支持 空/非法 → fallback。"""
-    truthy = {"1", "true", "yes", "y", "on"}
-    falsy  = {"0", "false", "no", "n", "off"}
+    truthy = {"1","true","yes","y","on"}
+    falsy  = {"0","false","no","n","off"}
     try:
-        if not cfg.has_option(section, option):
-            return fallback
+        if not cfg.has_option(section, option): return fallback
         raw = cfg.get(section, option)
-        if raw is None:
-            return fallback
+        if raw is None: return fallback
         s = str(raw).strip().lower()
-        if not s:
-            return fallback
+        if not s: return fallback
         if s in truthy: return True
         if s in falsy:  return False
         return fallback
@@ -146,16 +122,13 @@ def _cfg_bool(cfg: configparser.ConfigParser, section: str, option: str, fallbac
         return fallback
 
 def _win_hidden_popen_kwargs():
-    """
-    Windows 下隐藏子进程控制台窗口；非 Windows 返回空 kwargs。
-    """
     if os.name != "nt":
         return {}
     CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     try:
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
+        si.wShowWindow = 0
         return {"startupinfo": si, "creationflags": CREATE_NO_WINDOW}
     except Exception:
         return {"creationflags": CREATE_NO_WINDOW}
@@ -171,11 +144,9 @@ def _reg_str(root, subkey, name) -> Optional[str]:
         return None
 
 def _drive_ready(p: Path) -> bool:
-    """Windows: 判断盘符是否就绪（适配 iSCSI/网络盘）；非 Windows 恒为 True。"""
     try:
-        if os.name != "nt":
-            return True
-        d = p.drive  # e.g. 'X:'
+        if os.name != "nt": return True
+        d = p.drive
         return (not d) or Path(d + "\\").exists()
     except Exception:
         return False
@@ -184,10 +155,6 @@ def _path_ready(p: Path) -> bool:
     return _drive_ready(p) and p.exists()
 
 def _ensure_dir_ready(p: Path) -> Optional[Path]:
-    """
-    若盘符就绪但目录不存在，尝试创建；成功则返回绝对路径，失败/未就绪返回 None。
-    用于自动发现的 Workshop 根目录（修复 iSCSI 场景）。
-    """
     if not _drive_ready(p):
         return None
     try:
@@ -236,8 +203,7 @@ def find_all_workshop_roots() -> List[Path]:
 
 def _candidate_we_exes_from_cfg(cfg: configparser.ConfigParser) -> List[Path]:
     raw = expand(cfg.get("paths","we_exe",fallback="")).strip()
-    if not raw:
-        return []
+    if not raw: return []
     p = Path(raw)
     cands = []
     if p.suffix.lower() == ".exe":
@@ -268,8 +234,7 @@ def locate_we_exe(cfg: configparser.ConfigParser) -> Optional[Path]:
             c = cand.resolve()
         except Exception:
             c = cand
-        if c in seen:
-            continue
+        if c in seen: continue
         seen.add(c)
         if _path_ready(c):
             return c
@@ -320,10 +285,6 @@ def _make_session(https_proxy: str=""):
 
 # ---------- Web API 映射 & 调用 ----------
 def map_sort_to_query(sort_name: str) -> Tuple[int,int]:
-    """
-    返回 (query_type, days)
-    1=PublicationDate, 3=Trend, 9=TotalUniqueSubscriptions, 11=VotesUp
-    """
     s = (sort_name or "").lower()
     if s == "most recent": return 1, 0
     if s in ("top rated","most up votes"): return 11, 0
@@ -336,11 +297,78 @@ def map_sort_to_query(sort_name: str) -> Tuple[int,int]:
         return 3, 7
     return 3, 7
 
+# === 年龄映射/提取（以 tags 为主） ===
+_AGE_TAG_TO_CANON = {
+    "everyone": "G",
+    "questionable": "PG13",
+    "mature": "R",
+}
+_CANON_TO_WORKSHOP_TAG = {
+    "G": "Everyone",
+    "PG13": "Questionable",
+    "R": "Mature",
+}
+# 一些 KV 可能写法
+_AGE_NORMALIZE_KV = {
+    "everyone": "G", "g": "G",
+    "questionable": "PG13", "pg13": "PG13", "pg-13": "PG13",
+    "mature": "R", "r": "R", "r18": "R", "adult": "R", "adultonly": "R", "adult only": "R",
+}
+
+def _kv_lookup(item: dict) -> Dict[str, str]:
+    kv = {}
+    for kvp in (item.get("kv_tags") or []):
+        k_raw = kvp.get("key", "")
+        v_raw = kvp.get("value", "")
+        k = (k_raw or "").strip().lower()
+        v = (v_raw or "").strip()
+        if k and (k not in kv):
+            kv[k] = v
+    return kv
+
+def _extract_normalized_age(item: dict) -> Optional[str]:
+    # 1) 优先：从 tags 取 Everyone/Questionable/Mature
+    for t in (item.get("tags") or []):
+        tag = (t.get("tag") or "").strip().lower()
+        if tag in _AGE_TAG_TO_CANON:
+            return _AGE_TAG_TO_CANON[tag]
+    # 2) 兜底：从 KV 的 Age Rating 相近键取
+    kv = _kv_lookup(item)
+    v = (kv.get("age rating") or kv.get("agerating") or kv.get("age_rating") or "").strip().lower()
+    if not v:
+        # 极少数把 "Age Rating: XXX" 塞入普通标签文本里
+        for t in (item.get("tags") or []):
+            tx = (t.get("tag") or "").strip().lower()
+            if "age rating" in tx:
+                for sep in (":", "-", "—", "–"):
+                    if sep in tx:
+                        v = tx.split(sep, 1)[1].strip().lower()
+                        break
+                if v: break
+    v = v.replace("　", " ").replace("/", " ").strip()
+    if not v: return None
+    return _AGE_NORMALIZE_KV.get(v)
+
+def _age_single_workshop_tag_from_csv(ages_csv: str) -> Optional[str]:
+    """若 age 仅配置单一等级，则返回对应的 Workshop tag（Everyone/Questionable/Mature）。"""
+    wanted = [x.upper() for x in parse_csv(ages_csv)]
+    uniq = sorted(set(wanted))
+    if len(uniq) != 1:
+        return None
+    return _CANON_TO_WORKSHOP_TAG.get(uniq[0])
+
+def _age_match_any(item: dict, ages_csv: str) -> bool:
+    wanted = {x.upper() for x in parse_csv(ages_csv)}
+    if not wanted:
+        return True  # 未配置 age 不过滤
+    norm = _extract_normalized_age(item)
+    if norm is None:
+        # WE 基本都有年龄 tag；稳妥：不识别则不通过
+        return False
+    return norm in wanted
+# === 结束：年龄映射/提取 ===
+
 def query_files_webapi(cfg: configparser.ConfigParser) -> Tuple[List[int], Dict[int, dict], str]:
-    """
-    用 Web API 拉排序/筛选后的列表（优先），返回 (ids, detail_map, debug_msg）
-    使用 GET + input_json（Service interface）
-    """
     key = (cfg.get("steam","api_key",fallback="") or "").strip()
     if not key:
         return [], {}, "no_key"
@@ -357,10 +385,21 @@ def query_files_webapi(cfg: configparser.ConfigParser) -> Tuple[List[int], Dict[
     req_tags += parse_csv(cfg.get("filters","tags",fallback=""))
     exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
 
+    # ★ 若 age= 单值，则把对应 Workshop Tag 放入 requiredtags（服务端筛选）
+    age_tag = _age_single_workshop_tag_from_csv(cfg.get("filters","age",fallback=""))
+    if age_tag:
+        req_tags = list(dict.fromkeys(req_tags + [age_tag]))
+    # ★ 若 types= 单值，同理
+    type_tag = _single_type_workshop_tag_from_csv(cfg.get("filters","types",fallback=""))
+    if type_tag:
+        req_tags = list(dict.fromkeys(req_tags + [type_tag]))
+
     base_url = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
     ids: List[int] = []
     det: Dict[int, dict] = {}
     dbg: List[str] = []
+    if req_tags:
+        dbg.append(f"requiredtags={req_tags!r}")
 
     cursor = "*"
     for p in range(1, pages+1):
@@ -458,17 +497,27 @@ def map_sort_html(sort_name: str) -> Tuple[str,int]:
     if s in ("most subscriptions","most subscribed"): return "totaluniquesubscriptions", 0
     return "trend", 7
 
-def community_ids_html(sort_name: str, pages: int, per_page: int, https_proxy: str = "") -> List[int]:
+def community_ids_html(sort_name: str, pages: int, per_page: int,
+                       https_proxy: str = "", ages_csv: str = "", types_csv: str = "") -> List[int]:
     sess = _make_session(https_proxy)
     comm_sort, comm_days = map_sort_html(sort_name)
     out: List[int] = []; seen = set()
     base_url = "https://steamcommunity.com/workshop/browse/"
     headers = {"Referer": f"{base_url}?appid={APPID_WE}&browsesort={comm_sort}"}
+    # requiredtags[] 支持多个值（服务端 AND）
+    age_tag = _age_single_workshop_tag_from_csv(ages_csv)
+    type_tag = _single_type_workshop_tag_from_csv(types_csv)
+    required = []
+    if age_tag:  required.append(age_tag)
+    if type_tag: required.append(type_tag)
+
     for p in range(1, pages+1):
         params = {
             "appid": str(APPID_WE), "browsesort": comm_sort, "days": str(comm_days or 0),
             "actualsort": comm_sort, "l": "english", "numperpage": str(per_page), "p": str(p),
         }
+        if required:
+            params["requiredtags[]"] = required
         try:
             r = sess.get(base_url, params=params, headers=headers, timeout=(6,20))
             if not r.ok: continue
@@ -484,17 +533,6 @@ def community_ids_html(sort_name: str, pages: int, per_page: int, https_proxy: s
     return out
 
 # ---------- 过滤 ----------
-def _kv_lookup(item: dict) -> Dict[str, str]:
-    kv = {}
-    for kvp in (item.get("kv_tags") or []):
-        k_raw = kvp.get("key", "")
-        v_raw = kvp.get("value", "")
-        k = (k_raw or "").strip().lower()
-        v = (v_raw or "").strip()
-        if k and (k not in kv):
-            kv[k] = v
-    return kv
-
 _TYPE_ALIASES = {
     "video": {"video", "movie", "mp4", "webm"},
     "scene": {"scene", "scenery"},
@@ -503,6 +541,32 @@ _TYPE_ALIASES = {
     "wallpaper": {"wallpaper"},
     "preset": {"preset"},
 }
+
+# 单一类型 → Workshop tag（供服务端 requiredtags 使用）
+_TYPE_CANON_TO_TAG = {
+    "video": "Video",
+    "scene": "Scene",
+    "web": "Web",
+    "application": "Application",
+    "wallpaper": "Wallpaper",
+    "preset": "Preset",
+}
+def _single_type_workshop_tag_from_csv(types_csv: str) -> Optional[str]:
+    """
+    如果 [filters].types 只配置了一个值，则返回对应的 Workshop tag 字符串（如 "Scene"）。
+    多个值返回 None（因为服务端 requiredtags 是 AND 逻辑，不适合多选 OR）。
+    """
+    vals = [t.strip().lower() for t in parse_csv(types_csv)]
+    uniq = sorted(set(vals))
+    if len(uniq) != 1:
+        return None
+    t = uniq[0]
+    if t in _TYPE_CANON_TO_TAG:
+        return _TYPE_CANON_TO_TAG[t]
+    for canon, aliases in _TYPE_ALIASES.items():
+        if t == canon or t in aliases:
+            return _TYPE_CANON_TO_TAG.get(canon)
+    return t.title() if t else None
 
 def _type_matches(kv_type_val: str, tagset_lower: set, need_lower: set) -> bool:
     if not need_lower:
@@ -527,48 +591,6 @@ def _type_matches(kv_type_val: str, tagset_lower: set, need_lower: set) -> bool:
                 for canon, aliases in _TYPE_ALIASES.items():
                     if right in aliases and (canon in need_lower or (need_lower & aliases)):
                         return True
-    return False
-
-def _apply_mature_age_filter(item: dict, age: str) -> bool:
-    if not age: return True
-    a = age.strip().upper()
-    tags_lower = {(t.get("tag") or "").strip().lower() for t in (item.get("tags") or [])}
-    kv = _kv_lookup(item)
-    kv_age = (kv.get("age rating") or kv.get("agerating") or kv.get("age_rating") or "").strip().lower()
-    def any_true_keys(d, keys):
-        for k in keys:
-            v = d.get(k)
-            if isinstance(v, (int, bool)) and bool(v): return True
-            if isinstance(v, str) and v.strip().lower() in ("1","true","yes","y"): return True
-        return False
-    mature_flag = any_true_keys(item, ("mature_content","mature","is_mature","adultonly","adult_only","adult_content"))
-    if a in ("R","MATURE"):
-        if kv_age in ("mature","adult","r","r18"): return True
-        if mature_flag: return True
-        if any(x in tags_lower for x in ("mature","nsfw","r18","adult")): return True
-        return False
-    if a in ("PG13","PG-13","QUESTIONABLE"):
-        if kv_age in ("questionable","pg13","pg-13"): return True
-        if any(x in tags_lower for x in ("questionable","mild nudity","suggestive")): return True
-        if any(x in tags_lower for x in ("mature","nsfw","r18","adult")) or mature_flag: return False
-        return True
-    if a in ("G","EVERYONE"):
-        if kv_age in ("everyone","g"): return True
-        if any(x in tags_lower for x in ("mature","nsfw","r18","adult")) or mature_flag: return False
-        return True
-    return True
-
-def _apply_mature_age_filter_any(item: dict, ages_csv: str) -> bool:
-    """
-    允许 age 多选：例如 "G,PG13"；OR 逻辑，任意一个选项通过即通过。
-    留空等同不过滤。
-    """
-    ages = [a.strip() for a in (ages_csv or "").split(",") if a.strip()]
-    if not ages:
-        return True
-    for a in ages:
-        if _apply_mature_age_filter(item, a):
-            return True
     return False
 
 def filter_ids_with_details(base_ids: List[int], detail_map: Dict[int, dict], cfg: configparser.ConfigParser) -> List[int]:
@@ -607,8 +629,8 @@ def filter_ids_with_details(base_ids: List[int], detail_map: Dict[int, dict], cf
             if not ok:
                 continue
 
-        # age 多选过滤（OR）
-        if not _apply_mature_age_filter_any(it, ages_csv):
+        # ★ 年龄过滤（tags 优先，OR）
+        if not _age_match_any(it, ages_csv):
             continue
 
         if need_types_lower:
@@ -660,7 +682,7 @@ def steamcmd_download_batch(exe: Path, uid: str, pwd: Optional[str], guard: Opti
         universal_newlines=True,
         encoding="utf-8",
         errors="ignore",
-        **_win_hidden_popen_kwargs()   # ← 隐藏 steamcmd 黑窗
+        **_win_hidden_popen_kwargs()
     )
     all_out = io.StringIO()
     try:
@@ -694,9 +716,8 @@ def mirror_dir(src: Path, dst: Path) -> bool:
         rc = subprocess.run(
             ["robocopy", str(src), str(dst), "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP"],
             capture_output=True, text=False,
-            **_win_hidden_popen_kwargs()   # ← 隐藏 robocopy 窗口
+            **_win_hidden_popen_kwargs()
         )
-        # robocopy 0~7 都算成功/可忽略警告
         if rc.returncode <= 7: return True
     except Exception:
         pass
@@ -725,9 +746,6 @@ def find_entry(work_dir: Path) -> Optional[Path]:
     return vids[0] if vids else None
 
 def apply_in_we(entry: Path, we_exe: Path, retries: int = 3, delay_s: float = 1.5) -> None:
-    """
-    iSCSI 修复：初次挂载后可能短暂“设备未就绪”，这里做轻量重试。
-    """
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -741,7 +759,6 @@ def apply_in_we(entry: Path, we_exe: Path, retries: int = 3, delay_s: float = 1.
             last_err = e
             print(f"[apply/retry] 第 {attempt} 次异常，将在 {delay_s}s 后重试：{e}")
             time.sleep(delay_s)
-    # 最终失败
     raise last_err if last_err else RuntimeError("apply_in_we: 未知错误")
 
 def mirror_to_projects_backup(we_exe: Path, src_item_dir: Path, wid: int) -> Optional[Path]:
@@ -791,10 +808,6 @@ def cleanup_all_others_if_needed(current_wid: int,
                                  steamcmd_exe: Path,
                                  official_root: Path,
                                  we_exe: Path) -> None:
-    """
-    one_per_run=true & delete_previous=true 下，删除本地“非当前”的其它壁纸副本；
-    不重写/不清空 we_downloads.log，让日志长期累积用于去重。
-    """
     one_per_run = _cfg_bool(cfg, "subscribe", "one_per_run", True)
     delete_prev = _cfg_bool(cfg, "cleanup", "delete_previous", False)
     keep_n = _cfg_int(cfg, "cleanup", "keep_last_n", 0)
@@ -855,10 +868,9 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
     pages = _cfg_int(cfg, "fallback", "pages", 3)
     page_size = _cfg_int(cfg, "filters", "numperpage", _cfg_int(cfg, "fallback", "page_size", 40))
 
-    # ---- API 模式：按需多翻页，直到过滤后达到 min_candidates 或到达上限 ----
     if key and min_candidates > 0:
         print(f"[auto/api] min_candidates={min_candidates}, page_size={page_size}")
-        from requests.adapters import HTTPAdapter  # 保证 requests 存在
+        from requests.adapters import HTTPAdapter  # 确保 requests 存在
         sess = _make_session(https_proxy)
 
         qtype, days = map_sort_to_query(sort_name)
@@ -866,12 +878,20 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
         req_tags += parse_csv(cfg.get("filters","tags",fallback=""))
         exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
 
+        # ★ 单值 age/type → 服务端 requiredtags
+        age_tag = _age_single_workshop_tag_from_csv(cfg.get("filters","age",fallback=""))
+        if age_tag:
+            req_tags = list(dict.fromkeys(req_tags + [age_tag]))
+        type_tag = _single_type_workshop_tag_from_csv(cfg.get("filters","types",fallback=""))
+        if type_tag:
+            req_tags = list(dict.fromkeys(req_tags + [type_tag]))
+
         base_url = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
         ids: List[int] = []
         det: Dict[int, dict] = {}
         cursor = "*"
         p = 0
-        max_pages = max(pages, _cfg_int(cfg, "fallback", "max_pages", 30))  # 兜底上限
+        max_pages = max(pages, _cfg_int(cfg, "fallback", "max_pages", 30))
 
         while True:
             p += 1
@@ -899,7 +919,7 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
             if cursor:
                 payload["cursor"] = cursor
             else:
-                payload["page"] = p  # 兜底
+                payload["page"] = p
 
             params = {"key": key, "input_json": json.dumps(payload, separators=(",", ":"))}
 
@@ -917,17 +937,13 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
                     print(f"[auto/api] p{p}: empty items")
                     break
 
-                new_ids = 0
                 for it in items:
                     fid = int(str(it.get("publishedfileid", "0")))
-                    if not fid: 
-                        continue
+                    if not fid: continue
                     if fid not in det:
                         det[fid] = it
                         ids.append(fid)
-                        new_ids += 1
 
-                # 每页结束后立即过滤评估数量
                 filtered = filter_ids_with_details(ids, det, cfg)
                 print(f"[auto/api] after p{p}: raw={len(ids)} filtered={len(filtered)}")
                 if len(filtered) >= min_candidates:
@@ -946,12 +962,10 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
                 print(f"[auto/api] exception: {e!r}")
                 break
 
-        # 兜底：返回当前能拿到的
         filtered = filter_ids_with_details(ids, det, cfg)
         print(f"[auto/api] fallback filtered={len(filtered)}")
         return filtered
 
-    # ---- 旧逻辑（一次性拉若干页后再过滤） ----
     if key:
         ids_api, det_api, dbg = query_files_webapi(cfg)
         print(f"[auto/api] debug: {dbg}")
@@ -962,8 +976,11 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
         print("[auto/api] 0 条（或请求失败）。因为配置了 api_key，不回退 HTML。请检查 filters/sort。")
         return []
 
-    # ---- HTML 回退（不支持按需翻页，建议增大 [fallback].pages 或使用 api_key） ----
-    ids_html = community_ids_html(sort_name, pages, page_size, https_proxy=https_proxy)
+    # HTML 回退（无 api_key）
+    ages_csv = cfg.get("filters","age",fallback="")
+    types_csv = cfg.get("filters","types",fallback="")
+    ids_html = community_ids_html(sort_name, pages, page_size,
+                                  https_proxy=https_proxy, ages_csv=ages_csv, types_csv=types_csv)
     if not ids_html: return []
     det_more = fetch_details(ids_html, https_proxy=https_proxy)
     filtered = filter_ids_with_details(ids_html, det_more, cfg)
@@ -972,26 +989,22 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> List[int]:
 
 # ---------- 主执行（支持 skip 连续换下一个） ----------
 def run_once(cfg: configparser.ConfigParser) -> str:
-    # 路径
     steamcmd_path = expand(cfg.get("paths","steamcmd",fallback=""))
     if not steamcmd_path: raise RuntimeError("请在 [paths] steamcmd= 指定 steamcmd.exe")
     steamcmd_exe = Path(steamcmd_path)
     if not steamcmd_exe.exists(): raise RuntimeError(f"未找到 steamcmd：{steamcmd_exe}")
 
-    # ★ 改为“每轮定时检测” WE 路径
     we_exe = locate_we_exe(cfg)
     if not we_exe:
         print("[wait] 未检测到 Wallpaper Engine 可执行文件（可能磁盘未就绪/ISCSI 未挂载）。将于下个周期重试。")
         return "WAIT_WE"
 
-    # ★ 改为“每轮定时检测” Workshop 根目录（自动创建）
     official_root = locate_workshop_root(cfg)
     if not official_root:
         print("[wait] 未发现已就绪的 Workshop 目录（可能 Steam 库所在磁盘未挂载或目录尚未创建）。将于下个周期重试。")
         return "WAIT_WS"
     print("[workshop] official root:", official_root)
 
-    # 候选（ids 优先，否则自动）
     ids_conf = [int(x) for x in parse_csv(cfg.get("subscribe","ids",fallback="")) if x.isdigit()]
     if ids_conf:
         ids_all = list(dict.fromkeys(ids_conf))
@@ -1003,11 +1016,9 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         print("[pick] 无候选；请放宽 [filters] 或在 [subscribe] 填 ids。")
         return "NO_CANDIDATES"
 
-    # 状态
     state_file = HERE / cfg.get("paths","state_file",fallback="we_auto_state.json")
     state = load_state(state_file)
 
-    # 避免重复轮换：基于 we_downloads.log 与 state.history
     logp = HERE / cfg.get("logging","file",fallback="we_downloads.log")
     seen_ids = set(_read_logged_ids(logp))
     try:
@@ -1021,7 +1032,6 @@ def run_once(cfg: configparser.ConfigParser) -> str:
     else:
         print("[rotate] 候选全部都在历史里；暂时允许重复（已尽力避免）。")
 
-    # one_per_run 模式下：准备“本轮尝试序列”，遇到 skip 就自动换下一个
     one_per_run = _cfg_bool(cfg, "subscribe", "one_per_run", True)
     rotate_if_all_done = _cfg_bool(cfg, "subscribe", "rotate_if_all_done", True)
     max_attempts = _cfg_int(cfg, "subscribe", "max_attempts_per_run", 5)
@@ -1037,7 +1047,6 @@ def run_once(cfg: configparser.ConfigParser) -> str:
 
     if one_per_run:
         attempt_ids: List[int] = []
-        # 允许环绕（当 rotate_if_all_done=True）
         max_try = min(max_attempts, n if rotate_if_all_done else (n - cur))
         for k in range(max_try):
             idx = cur + k
@@ -1049,11 +1058,9 @@ def run_once(cfg: configparser.ConfigParser) -> str:
             attempt_ids.append(ids_all[idx])
         print(f"[pick] 本轮尝试顺序（最多 {len(attempt_ids)} 次）：{attempt_ids}")
     else:
-        # 非 one_per_run：一次性跑全部
         attempt_ids = ids_all
         print(f"[pick] 非 one_per_run 模式：本轮将处理 {len(attempt_ids)} 个条目")
 
-    # 逐个尝试直到成功应用（one_per_run），或全部处理（非 one_per_run）
     applied = False
     attempts_made = 0
     base_tmp_root = steamcmd_exe.parent / "steamapps" / "workshop" / "content" / str(APPID_WE)
@@ -1063,7 +1070,6 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         attempts_made += 1
         current_wid = wid
 
-        # 下载（每次只下当前一个；复用已保存凭证时密码可以留空）
         username = cfg.get("auth","steam_username",fallback="").strip() or os.environ.get("STEAM_USERNAME","").strip()
         password = cfg.get("auth","steam_password",fallback=os.environ.get("STEAM_PASSWORD","")).strip() or None
         guard    = cfg.get("auth","steam_guard_code",fallback=os.environ.get("STEAM_GUARD_CODE","")).strip() or None
@@ -1072,22 +1078,18 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         print(f"[login] 账号：{username}（若未提供密码/验证码将尝试用已保存凭证）")
         ok, out = steamcmd_download_batch(steamcmd_exe, username, password, guard, [wid])
         if not ok:
-            # 登录失败/网络问题这类硬错误：直接结束本轮（避免无限重试）
             save_state(state_file, state)
             raise RuntimeError("steamcmd 登录或下载失败")
 
-        # 校验落地目录
         src = base_tmp_root / str(wid)
         if not src.exists() or not any(src.rglob("*")):
             print(f"[skip] 未找到下载目录：{src}（可能是合集占位/受限条目），尝试下一个...")
             state.setdefault("failed_recent", []).append(wid)
-            # 未成功应用，不写入日志/历史；继续下一个
-            if not one_per_run:
+            if one_per_run:
                 continue
             else:
                 continue
 
-        # 镜像到官方目录
         dst = official_root / str(wid)
         print(f"[mirror] {src} -> {dst}")
         if not mirror_dir(src, dst):
@@ -1098,11 +1100,9 @@ def run_once(cfg: configparser.ConfigParser) -> str:
             else:
                 continue
 
-        # 复制到 projects/backup
         proj_dst = mirror_to_projects_backup(we_exe, dst, wid)
         if proj_dst: print(f"[integrate] mirrored to projects/backup: {proj_dst}")
 
-        # 强制应用（带重试）
         entry = find_entry(dst) or find_entry(src)
         if not entry:
             print(f"[warn] 未找到可应用入口文件（project.json/index.html/视频），跳过 {wid}")
@@ -1116,7 +1116,6 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         try:
             apply_in_we(entry, we_exe)
             applied = True
-            # 仅成功后写入历史与日志
             state["last_applied"] = wid
             hist = state.get("history", []); hist.append(wid); state["history"] = hist[-500:]
             if _cfg_bool(cfg,"logging","enable",True):
@@ -1124,7 +1123,6 @@ def run_once(cfg: configparser.ConfigParser) -> str:
                     f.write(f"[{now_str()}] https://steamcommunity.com/sharedfiles/filedetails/?id={wid}\n")
             cleanup_all_others_if_needed(wid, cfg, steamcmd_exe, official_root, we_exe)
 
-            # 跟踪（去脏）
             prev_tracked: List[int] = []
             for t in state.get("tracked_ids", []):
                 ti = _safe_int(t, 0)
@@ -1142,18 +1140,15 @@ def run_once(cfg: configparser.ConfigParser) -> str:
             state.setdefault("failed_recent", []).append(wid)
             applied = False
 
-        # one_per_run：成功即结束本轮；非 one_per_run：继续处理下一条
         if one_per_run and applied:
             break
 
-    # 更新游标：前进 attempts_made 个位置
     if attempts_made > 0:
-        if rotate_if_all_done:
+        if _cfg_bool(cfg, "subscribe", "rotate_if_all_done", True):
             state["cursor"] = (cur + attempts_made) % n
         else:
             state["cursor"] = min(n, cur + attempts_made)
 
-    # 兜底应用
     if one_per_run and (not applied) and (current_wid is not None):
         dst_try = official_root / str(current_wid)
         src_try = steamcmd_exe.parent / "steamapps" / "workshop" / "content" / str(APPID_WE) / str(current_wid)
@@ -1169,14 +1164,85 @@ def run_once(cfg: configparser.ConfigParser) -> str:
     print("[done] 本轮完成。")
     return "DONE"
 
+# =========================
+# RUN_NOW 事件：唤醒并立刻执行一轮
+# =========================
+# 说明：
+# - 托盘/外部进程调用 SetEvent(Global\\WEAutoTrayRunNow_xxx) 后，本进程会从等待中醒来，立即 run_once。
+# - 事件为“手动复位”，收到后本进程会 ResetEvent，避免粘连。
+if os.name == "nt":
+    kernel32 = ctypes.windll.kernel32
+else:
+    kernel32 = None
+WAIT_OBJECT_0 = 0x00000000
+
+def _run_now_event_name() -> str:
+    try:
+        base = str(Path(sys.executable).resolve())
+    except Exception:
+        base = sys.argv[0]
+    h = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:8]
+    return f"Global\\WEAutoTrayRunNow_{h}"
+
+def _create_named_event_manual_reset(name: str, initial: bool=False):
+    if os.name != "nt" or not kernel32:
+        return None
+    return kernel32.CreateEventW(None, True, bool(initial), name)
+
+def _open_named_event(name: str):
+    if os.name != "nt" or not kernel32:
+        return None
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    SYNCHRONIZE = 0x00100000
+    EVENT_MODIFY_STATE = 0x0002
+    return kernel32.OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, False, name)
+
+def _reset_event(h) -> None:
+    if os.name == "nt" and kernel32 and h:
+        try: kernel32.ResetEvent(h)
+        except Exception: pass
+
+def _wait_run_now_or_timeout(h, timeout_s: float) -> bool:
+    """等待 RUN_NOW 事件或超时；返回 True 表示被事件触发提前唤醒。"""
+    if os.name != "nt" or not kernel32 or not h:
+        time.sleep(max(0.0, float(timeout_s))); return False
+    ms = max(0, int(timeout_s * 1000))
+    rc = kernel32.WaitForSingleObject(h, ms)
+    if rc == WAIT_OBJECT_0:
+        _reset_event(h)
+        print("[wake] 收到 RUN_NOW 事件，提前执行一轮。")
+        return True
+    return False
+
+# ---------- 入口 ----------
 def main():
+    # 可选：单次执行模式（不进入循环；便于脚本/计划任务调用）
+    if "--once" in sys.argv:
+        cfg = read_conf()
+        try:
+            run_once(cfg)
+        except Exception as e:
+            print("[error/once]", e)
+            sys.exit(1)
+        sys.exit(0)
+
     cfg = read_conf()
     mode = cfg.get("subscribe","mode",fallback="steamcmd").strip().lower()
     if mode != "steamcmd":
         print(f"[exit] [subscribe].mode={mode}；本脚本仅实现 steamcmd 模式。"); return
+
+    # NEW: 创建/打开 RUN_NOW 事件
+    run_now_evt = None
+    if os.name == "nt":
+        try:
+            name = _run_now_event_name()
+            run_now_evt = _open_named_event(name) or _create_named_event_manual_reset(name, initial=False)
+        except Exception:
+            run_now_evt = None
+
     run_on_start = _cfg_bool(cfg, "schedule", "run_on_startup", True)
     interval_s = parse_interval(cfg.get("schedule","interval",fallback=""))
-    # 固定检测周期（默认 5 分钟）；可在 [schedule] detect_interval=5m 覆盖
     detect_s = parse_interval(cfg.get("schedule","detect_interval", fallback="5m"))
     if detect_s <= 0: detect_s = 300
 
@@ -1188,11 +1254,11 @@ def main():
             print("[error/startup]", e)
             status = "ERROR"
 
-    # 若未设置 interval（<=0），但处于等待路径就绪，则仍按固定检测周期轮询
     if interval_s <= 0:
+        # 无主循环，仅在 WAIT_* 下检测；用“事件或超时”代替纯 sleep
         while isinstance(status, str) and status.startswith("WAIT_"):
+            _wait_run_now_or_timeout(run_now_evt, detect_s)
             try:
-                time.sleep(detect_s)
                 status = run_once(cfg)
             except KeyboardInterrupt:
                 print("\n[exit] 用户中断"); break
@@ -1203,7 +1269,7 @@ def main():
     while True:
         try:
             sleep_for = detect_s if (isinstance(status, str) and status.startswith("WAIT_")) else interval_s
-            time.sleep(sleep_for)
+            _wait_run_now_or_timeout(run_now_evt, sleep_for)
             status = run_once(cfg)
         except KeyboardInterrupt:
             print("\n[exit] 用户中断"); break
