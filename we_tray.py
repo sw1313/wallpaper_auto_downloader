@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-we_tray.py（Win32 托盘 · 登录完善最终版 r12）
+we_tray.py（Win32 托盘 · 登录完善最终版 r13）
 - 逐字符读取 + 静默间隙推断
 - 启动即监控“登录阶段”，解决只打印 banner 就卡住的情况
-- 等待手机批准：使用 Tk 顶层 toast 窗口（非阻塞），在“登录成功/进入2FA”时自动销毁
-- 登录成功：显示 5s 的成功 toast，toast 消失后再重启 worker（严格顺序）
+- 等待手机批准：Tk 顶层 toast（非阻塞），在“登录成功/进入2FA”时自动销毁
+- 登录成功 toast：显示 5s 后自动关闭，然后再重启 worker（严格顺序）
 - 行级写回 config 的 [auth].steam_username（保留注释/格式）
+- PyInstaller 单文件：优先加载 EXE 内嵌图标，其次 MEIPASS/同目录，托盘图标稳定
+- 隐藏 steamcmd 窗口（CREATE_NO_WINDOW + 兜底按 PID 隐藏顶层窗）
 """
 
 from __future__ import annotations
@@ -117,6 +119,7 @@ JobObjectExtendedLimitInformation  = 9
 
 # --------- Shell / Win32 原型 ----------
 WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT, HWND, wintypes.UINT, WPARAM, LPARAM)
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, HWND, wintypes.LPARAM)
 
 class WNDCLASS(ctypes.Structure):
     _fields_ = [
@@ -206,6 +209,17 @@ kernel32.GetModuleHandleW.restype  = HINSTANCE
 
 wtsapi32.WTSRegisterSessionNotification.argtypes   = [HWND, wintypes.DWORD]
 wtsapi32.WTSUnRegisterSessionNotification.argtypes = [HWND]
+
+# ---- 枚举/隐藏窗口（兜底用）----
+user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+user32.EnumWindows.restype  = wintypes.BOOL
+user32.GetWindowThreadProcessId.argtypes = [HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype  = wintypes.DWORD
+user32.IsWindowVisible.argtypes = [HWND]
+user32.IsWindowVisible.restype  = wintypes.BOOL
+user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
+user32.ShowWindow.restype  = wintypes.BOOL
+SW_HIDE = 0
 
 # --------- CredUI ----------
 class CREDUI_INFO(ctypes.Structure):
@@ -513,6 +527,31 @@ def _win_hidden_popen_kwargs():
     except Exception:
         return {"creationflags": CREATE_NO_WINDOW}
 
+def _hide_top_windows_by_pid(pid: int, duration_s: float = 3.0, poll_interval_s: float = 0.1):
+    """兜底：在 duration_s 内反复枚举顶层窗口，凡属于 pid 的可见窗口都隐藏。"""
+    if not pid:
+        return
+    end_ts = time.time() + max(0.1, duration_s)
+
+    @WNDENUMPROC
+    def _enum_proc(hwnd, lparam):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            dw_pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(dw_pid))
+            if dw_pid.value == pid:
+                try: user32.ShowWindow(hwnd, SW_HIDE)
+                except Exception: pass
+        except Exception:
+            pass
+        return True
+
+    while time.time() < end_ts:
+        try: user32.EnumWindows(_enum_proc, 0)
+        except Exception: pass
+        time.sleep(poll_interval_s)
+
 def start_worker_and_reader(console: ConsoleWindow, job_handle: int | None = None) -> WorkerProc:
     exe = sys.executable
     if getattr(sys, "frozen", False):
@@ -743,15 +782,66 @@ class Win32TrayApp:
         nid.guidItem = self.tray_guid
         return nid
 
+    def _load_icon(self):
+        IMAGE_ICON      = 1
+        LR_LOADFROMFILE = 0x00000010
+        LR_DEFAULTSIZE  = 0x00000040
+
+        # 1) 优先：加载 EXE 内嵌图标（PyInstaller --icon）
+        try:
+            hinst = kernel32.GetModuleHandleW(None)
+            for resid in (1, 101):
+                try:
+                    h = user32.LoadImageW(hinst, MAKEINTRESOURCE(resid), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE)
+                    if h:
+                        self.console.append(f"[tray] 已加载嵌入式 EXE 图标（资源ID={resid}）。")
+                        return HICON(h)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2) 其次：从 MEIPASS（one-file 临时目录）加载
+        try:
+            meipass = getattr(sys, "_MEIPASS", "")
+            if meipass:
+                for name in ("app.ico", "we.ico", "tray.ico"):
+                    p = Path(meipass) / name
+                    if p.exists():
+                        h = user32.LoadImageW(None, str(p), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                        if h:
+                            self.console.append(f"[tray] 已从 MEIPASS 加载图标：{p.name}")
+                            return HICON(h)
+        except Exception:
+            pass
+
+        # 3) 再尝试：EXE 所在目录、脚本目录
+        for base in (Path(sys.executable).parent, Path(__file__).resolve().parent):
+            for name in ("app.ico", "we.ico", "tray.ico"):
+                p = base / name
+                if p.exists():
+                    try:
+                        h = user32.LoadImageW(None, str(p), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                        if h:
+                            self.console.append(f"[tray] 已加载图标文件：{p}")
+                            return HICON(h)
+                    except Exception:
+                        pass
+
+        # 4) 最后：系统默认图标
+        IDI_APPLICATION = 32512
+        self.console.append("[tray] 未找到自定义图标，使用系统默认图标。")
+        return user32.LoadIconW(None, MAKEINTRESOURCE(IDI_APPLICATION))
+
     def _add_icon(self):
         if not self.hwnd: return
         if not self.hicon: self.hicon = self._load_icon()
         nid = self._build_nid()
-        self._notify(NIM_ADD, nid)
+        ok_add = self._notify(NIM_ADD, nid)
         nid.uTimeoutOrVersion = NOTIFYICON_VERSION_4
-        self._notify(NIM_SETVERSION, nid)
-        self.added = True
-        self.console.append("[tray] 已添加托盘图标（v4）。")
+        ok_ver = self._notify(NIM_SETVERSION, nid)
+        self.added = bool(ok_add and ok_ver)
+        self.console.append(f"[tray] 添加托盘图标：{'成功' if self.added else '失败'}（NIM_ADD={ok_add}, SETVER={ok_ver}）。")
 
     def _modify_icon(self):
         if not self.added:
@@ -766,21 +856,6 @@ class Win32TrayApp:
         except Exception: pass
         self.added = False
         self.console.append("[tray] 托盘图标已删除。")
-
-    def _load_icon(self):
-        IMAGE_ICON      = 1
-        LR_LOADFROMFILE = 0x00000010
-        LR_DEFAULTSIZE  = 0x00000040
-        for name in ["we.ico", "app.ico", "tray.ico"]:
-            p = Path(__file__).with_name(name)
-            if p.exists():
-                h = user32.LoadImageW(None, str(p), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
-                if h:
-                    self.console.append(f"[tray] 已加载自定义图标：{p.name}")
-                    return HICON(h)
-        IDI_APPLICATION = 32512
-        self.console.append("[tray] 未找到自定义图标，使用系统图标。")
-        return user32.LoadIconW(None, MAKEINTRESOURCE(IDI_APPLICATION))
 
     # ---------- 右键菜单 ----------
     def _show_context_menu(self):
@@ -933,7 +1008,7 @@ class Win32TrayApp:
             need_mobile_confirm=self._contains_any(out_low, mobile_kw),
         )
 
-    # ---------- 登录一次（逐字符读取 + 静默间隙推断；启动即监控） ----------
+    # ---------- 登录一次（逐字符读取 + 静默间隙推断） ----------
     def _steamcmd_login_once(self, steamcmd_exe: Path, username: str, password: Optional[str], guard: Optional[str]) -> tuple[bool, str, dict, bool]:
         args = []
         if guard:
@@ -951,7 +1026,12 @@ class Win32TrayApp:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
+            **_win_hidden_popen_kwargs()  # 关键：隐藏控制台窗口
         )
+
+        # 兜底：若 steamcmd 仍弹窗，3 秒内持续隐藏其顶层窗口
+        threading.Thread(target=lambda: _hide_top_windows_by_pid(p.pid, duration_s=3.0),
+                         daemon=True).start()
 
         enc = "mbcs" if os.name == "nt" else (locale.getpreferredencoding(False) or "utf-8")
 
@@ -982,7 +1062,7 @@ class Win32TrayApp:
 
         all_bytes = bytearray()
         last_activity_ts = time.time()
-        login_phase_started = {"v": True}   # 启动即视为“登录阶段”
+        login_phase_started = {"v": True}
         mobile_hint_shown = {"v": False}
 
         # 静默间隙看门狗：提示“请在手机上确认”
@@ -1001,7 +1081,6 @@ class Win32TrayApp:
                             self._mobile_prompt_shown = True
                             mobile_hint_shown["v"] = True
                             self.console.append(f"[login] {gap:.1f}s 无新输出，推断在等待手机确认，延长等待 {int(MOBILE_CONFIRM_MAX_WAIT_S)}s。")
-                            # toast（可被后续事件主动关闭）
                             self.console.show_toast(
                                 key="mobile_confirm",
                                 title="请在手机上确认",
@@ -1012,7 +1091,6 @@ class Win32TrayApp:
                     last_activity_ts = time.time()
             with self._mobile_prompt_lock:
                 self._mobile_prompt_shown = False
-                # 结束时保险收尾
                 self.console.close_toast("mobile_confirm")
 
         threading.Thread(target=_gap_watchdog, daemon=True).start()
@@ -1086,7 +1164,6 @@ class Win32TrayApp:
                 pass
             with self._mobile_prompt_lock:
                 self._mobile_prompt_shown = False
-            # 保险清理
             self.console.close_toast("mobile_confirm")
 
         try:
@@ -1111,7 +1188,6 @@ class Win32TrayApp:
             timeout_ms=5000
         )
         def _do():
-            # toast 消失后再执行
             self.console.close_toast("login_success")
             self._restart_worker()
         threading.Timer(5.1, _do).start()
@@ -1154,7 +1230,6 @@ class Win32TrayApp:
                 continue
 
             if ok:
-                # 成功 → 关闭“手机确认”toast → 展示成功 toast（5s）→ toast 后重启 worker
                 self.console.close_toast("mobile_confirm")
                 try: self._save_username_to_cfg_preserve(username)
                 except Exception as e: self.console.append(f"[login] 写入配置失败：{e}")
@@ -1164,7 +1239,6 @@ class Win32TrayApp:
             if flags.get("need_mobile_confirm") or flags.get("maybe_waiting_mobile") or timed_out:
                 self.console.append("[login] 手机确认等待未完成，转入 2FA 验证码流程。")
 
-            # 进入 2FA 前关闭“手机确认”toast
             self.console.close_toast("mobile_confirm")
 
             for _try in range(3):
