@@ -17,7 +17,7 @@ Before using, extract steamcmd into a folder, and set the path to steamcmd.exe i
 <br/>
 After starting the program, a tray icon will appear. Right-click to set whether the app runs at startup, or to switch wallpapers immediately. Left-click opens the console (to check if login and wallpaper download work properly). It is recommended not to switch wallpapers too frequently, as this may trigger Steam’s anti-bot mechanisms.<br/>
 <br/>
-Since steamcmd uses an independent Steam login, the program may not be able to properly subscribe while downloading.<br/>
+SDue to steamcmd being a standalone Steam login, the Steam client may require re-login after logging in, and during the program download process, Wallpaper Engine may not be able to subscribe properly.<br/>
 <br/>
 Wallpaper Engine - 壁纸定时自动切换应用程序<br/>
 通过steamcmd自动下载创意工坊文件并让we应用来定时切换壁纸<br/>
@@ -32,4 +32,4 @@ steamcmd（steamcmd 路径,需要先下载steamcmd：https://steamcdn-a.akamaihd
 steam_username：（需要登录的购买了wallpaper engine的账号）<br/>
 使用之前，先解压steamcmd放入某个文件夹，config里填入该steamcmd.exe所在路径。然后在托盘图标菜单选择登录账号，然后按流程操作
 程序启动后，会在应用托盘显示一个图标，右键可以设置应用是否开机自启，立即更换壁纸，左键为查看控制台（可以排查是否正常登录和下载了壁纸），建议不要更换壁纸太过频繁，可能触发steam反爬机制<br/>
-由于steamcmd是独立的steam登录，程序登录账号下载的时候可能无法正常订阅
+由于steamcmd是独立的steam登录，登录账号后steam客户端可能需要重新登录，程序下载过程中wallpaper engine内可能无法正常订阅
