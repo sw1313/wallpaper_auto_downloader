@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-we_tray.py（Win32 托盘 · 登录完善最终版 r14）
+we_tray.py（Win32 托盘 · 登录完善最终版 r16）
 - 逐字符读取 + 静默间隙推断
 - 等待手机批准：Tk toast（非阻塞），在“登录成功/进入2FA”时自动销毁
 - 登录成功 toast：显示 5s 后自动关闭，然后再重启 worker（严格顺序）
@@ -10,6 +10,11 @@ we_tray.py（Win32 托盘 · 登录完善最终版 r14）
 - 行级写回 config 的 [auth].steam_username（保留注释/格式）
 - PyInstaller 单文件：优先加载 EXE 内嵌图标，其次 MEIPASS/同目录
 - 隐藏 steamcmd 窗口（CREATE_NO_WINDOW + 兜底按 PID 隐藏顶层窗）
+
+r16 变更（彻底移除“TaskbarCreated 重建”）：
+- [移除] 不再注册/处理 TaskbarCreated 广播，不再在任务栏重启时重建托盘图标。
+- [保持] 仅启动时执行 NIM_ADD，电源/会话消息仅执行 NIM_MODIFY（刷新），不会触发重建。
+- [保持] NIM_SETVERSION 失败不影响 added 状态。
 """
 
 from __future__ import annotations
@@ -752,7 +757,6 @@ class Win32TrayApp:
         self.hicon = None
         self.added = False
         self.tray_guid = self._make_guid_from_exe()
-        self._taskbar_created_msg = 0
 
         self.class_name = "WEAutoTrayWin32HiddenWindow"
         self.tip_text = "WE Auto Runner - 正在运行"
@@ -793,6 +797,17 @@ class Win32TrayApp:
         nid.hIcon = hicon or self.hicon
         nid.szTip = self.tip_text
         nid.guidItem = self.tray_guid
+        return nid
+
+    # 仅用于 NIM_SETVERSION
+    def _build_nid_for_setver(self) -> NOTIFYICONDATAW:
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = 0
+        nid.uFlags = 0
+        nid.guidItem = self.tray_guid
+        nid.uTimeoutOrVersion = NOTIFYICON_VERSION_4
         return nid
 
     def _load_icon(self):
@@ -837,34 +852,48 @@ class Win32TrayApp:
                             return HICON(h)
                     except Exception:
                         pass
-        # 4) 默认
+        # 4) 默认（Win32 原生）
         IDI_APPLICATION = 32512
         self.console.append("[tray] 未找到自定义图标，使用系统默认图标。")
         return user32.LoadIconW(None, MAKEINTRESOURCE(IDI_APPLICATION))
+
+    def _set_tray_version(self):
+        nid_ver = self._build_nid_for_setver()
+        ok_ver = self._notify(NIM_SETVERSION, nid_ver)
+        self.console.append(f"[tray] 设定托盘协议版本：{'成功' if ok_ver else '失败（忽略）'}。")
+        return ok_ver
 
     def _add_icon(self):
         if not self.hwnd: return
         if not self.hicon: self.hicon = self._load_icon()
         nid = self._build_nid()
         ok_add = self._notify(NIM_ADD, nid)
-        nid.uTimeoutOrVersion = NOTIFYICON_VERSION_4
-        ok_ver = self._notify(NIM_SETVERSION, nid)
-        self.added = bool(ok_add and ok_ver)
-        self.console.append(f"[tray] 添加托盘图标：{'成功' if self.added else '失败'}（NIM_ADD={ok_add}, SETVER={ok_ver}）。")
+
+        if ok_add:
+            self.added = True
+            self._set_tray_version()
+        else:
+            self.added = False
+
+        self.console.append(f"[tray] 添加托盘图标：{'成功' if ok_add else '失败'}（added={self.added}）。")
 
     def _modify_icon(self):
         if not self.added:
-            self._add_icon(); return
+            self.console.append("[tray] 跳过刷新：图标未标记为已添加。")
+            return
         nid = self._build_nid()
-        self._notify(NIM_MODIFY, nid)
+        ok = self._notify(NIM_MODIFY, nid)
+        self.console.append(f"[tray] 刷新托盘图标：{'成功' if ok else '失败（不重建）'}。")
 
     def _delete_icon(self):
         if not self.added: return
-        nid = self._build_nid(flags=NIF_GUID)
-        try: self._notify(NIM_DELETE, nid)
-        except Exception: pass
+        nid = self._build_nid(flags=NIF_GUID)  # 仅凭 GUID 删除
+        try:
+            ok = self._notify(NIM_DELETE, nid)
+            self.console.append(f"[tray] 托盘图标已删除：{'成功' if ok else '失败'}。")
+        except Exception:
+            pass
         self.added = False
-        self.console.append("[tray] 托盘图标已删除。")
 
     # ---------- 右键菜单 ----------
     def _show_context_menu(self):
@@ -1191,8 +1220,8 @@ class Win32TrayApp:
         threading.Timer(5.1, _do).start()
 
     def _restart_worker(self):
+        self.console.append("[login] 正在重启 worker 以应用新账号 ...")
         try:
-            self.console.append("[login] 正在重启 worker 以应用新账号 ...")
             # 1) 通知退出 + 等待
             self._signal_worker_exit_and_wait(wait_s=2.5)
             # 2) **关键**：Reset 退出事件，避免新 worker 立即退出
@@ -1327,7 +1356,6 @@ class Win32TrayApp:
         elif cmd == IDM_FORCE_SWITCH:
             self.console.append("[action] 立即更换一次：已通知 worker 立刻执行一轮。")
             try:
-                # 脉冲触发，避免长时间保持置位影响后续逻辑
                 _pulse_event(self._run_now_evt, duration_s=0.08)
             except Exception:
                 self.console.append("[action] 通知失败：RUN_NOW 事件句柄无效。")
@@ -1335,14 +1363,12 @@ class Win32TrayApp:
             cur = is_autostart_enabled()
             set_autostart(not cur)
             self.console.append(f"[autostart] 已设置开机自启 = {not cur}")
-            self._modify_icon()
+            self._modify_icon()  # 仅刷新
         elif cmd == IDM_EXIT:
             self._exit_app()
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
-        if msg == self._taskbar_created_msg:
-            self.console.append("[tray] 收到 TaskbarCreated，重加托盘。")
-            self._add_icon(); return 0
+        # 注：已移除 TaskbarCreated 处理，不再重建托盘图标
 
         if msg == WM_TRAYICON:
             sub = int(lparam) & 0xFFFFFFFF
@@ -1353,18 +1379,17 @@ class Win32TrayApp:
             return 0
 
         if msg == WM_POWERBROADCAST and wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
-            self.console.append("[tray] 电源恢复，刷新托盘。")
+            self.console.append("[tray] 电源恢复，刷新托盘（不重建）。")
             self._modify_icon(); return 1
 
         if msg == WM_WTSSESSION_CHANGE and wparam in (WTS_SESSION_UNLOCK, WTS_SESSION_LOGON):
-            self.console.append("[tray] 会话解锁/登录，刷新托盘。")
+            self.console.append("[tray] 会话解锁/登录，刷新托盘（不重建）。")
             self._modify_icon(); return 0
 
         if msg == WM_COMMAND:
             self._on_cmd(wparam & 0xFFFF); return 0
 
         if msg == WM_APP_LOGIN:
-            # 防止重复登录线程
             if not self._login_active:
                 threading.Thread(target=self._login_flow_wincred, daemon=True).start()
             else:
@@ -1407,8 +1432,8 @@ class Win32TrayApp:
 
         try: wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
         except Exception: pass
-        self._taskbar_created_msg = user32.RegisterWindowMessageW("TaskbarCreated")
 
+        # 仅启动时添加一次托盘图标
         self._add_icon()
 
         msg = wintypes.MSG()
