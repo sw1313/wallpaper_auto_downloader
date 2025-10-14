@@ -86,3 +86,8 @@ steam_guard_code=
 # 是否在脚本目录生成日志文件，记录下载/应用过的创意工坊地址
 enable=true
 file=we_downloads.log
+
+[we_control]
+enable = false
+cmd = -control closeWallpaper -monitor 1
+delay = 1s
