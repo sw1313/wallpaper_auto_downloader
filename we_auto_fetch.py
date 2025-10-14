@@ -11,10 +11,18 @@ we_auto_fetch.py — Steam Workshop -> Wallpaper Engine 自动拉取/筛选/应�
 - 控制台会输出：各维度配置、抓取分页摘要、应用时该条目的 Type/Age/Resolution/Genres 等元信息。
 - HTML 排序映射修正：mostrecent / lastupdated / totaluniquesubscribers / trend(+days)。
 - **修复“卡在即将应用”**：应用壁纸时不再等待 wallpaper32/64.exe 退出；先确保 WE 在运行，再用短超时发送 -control 命令。
+
+新增（2025-10-14）：
+- [we_control] 在检测到 Wallpaper Engine 正在运行时（与由谁启动无关），可按配置延迟执行一次自定义指令。
+  配置示例：
+    [we_control]
+    enable = true
+    cmd    = -control closeWallpaper -monitor 1
+    delay  = 3s
 """
 
 from __future__ import annotations
-import configparser, json, os, re, shutil, subprocess, sys, time, io, ctypes, hashlib, locale
+import configparser, json, os, re, shutil, subprocess, sys, time, io, ctypes, hashlib, locale, threading
 from ctypes import wintypes
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -280,6 +288,54 @@ def _ensure_we_running(we_bin: Path, wait_s: float = 15.0) -> None:
         if _is_proc_running("wallpaper64.exe", "wallpaper32.exe", "wallpaper_engine.exe"):
             return
         time.sleep(0.3)
+
+# ===== 新增：WE 运行后执行一次自定义指令（不依赖启动来源/状态跃迁） =====
+_WE_START_CMD_DONE = False
+
+def _maybe_run_custom_we_cmd(cfg: configparser.ConfigParser, we_exe: Optional[Path] = None) -> None:
+    """
+    条件：
+      - [we_control].enable = true
+      - Wallpaper Engine 正在运行（不管谁启动的，程序也可能更晚启动）
+      - 本进程尚未执行过（只执行一次）
+    行为：
+      - 等待 [we_control].delay 后，用 we_exe + [we_control].cmd 作为参数启动一次
+    """
+    global _WE_START_CMD_DONE
+    if _WE_START_CMD_DONE:
+        return
+    if not _cfg_bool(cfg, "we_control", "enable", False):
+        return
+    raw_cmd = (cfg.get("we_control", "cmd", fallback="") or "").strip()
+    if not raw_cmd:
+        return
+    delay_s = parse_interval(cfg.get("we_control", "delay", fallback="0s"))
+    if we_exe is None:
+        we_exe = locate_we_exe(cfg)
+    if not we_exe or not we_exe.exists():
+        return
+    # 仅基于“是否正在运行”的静态判定，不做“从未运行->运行”的跃迁判断
+    if not _is_proc_running("wallpaper64.exe", "wallpaper32.exe", "wallpaper_engine.exe"):
+        return
+
+    # 标记为已安排，避免重复；采用后台线程延迟执行
+    _WE_START_CMD_DONE = True
+
+    def _runner():
+        try:
+            if delay_s > 0:
+                time.sleep(delay_s)
+            try:
+                import shlex
+                args = shlex.split(raw_cmd, posix=False)
+            except Exception:
+                args = raw_cmd.split()
+            print(f"[we_control] 执行：{we_exe.name} {raw_cmd}（延迟 {delay_s}s）")
+            subprocess.Popen([str(we_exe), *args], **_win_hidden_popen_kwargs())
+        except Exception as e:
+            print("[we_control] 运行失败：", e)
+
+    threading.Thread(target=_runner, daemon=True).start()
 
 # ---------- HTTP ----------
 def _make_session(https_proxy: str=""):
@@ -997,6 +1053,9 @@ def run_once(cfg: configparser.ConfigParser) -> str:
         print("[wait] 未检测到 Wallpaper Engine 可执行文件。")
         return "WAIT_WE"
 
+    # 每轮也尝试触发一次（若还未触发且 WE 已在运行）
+    _maybe_run_custom_we_cmd(cfg, we_exe)
+
     official_root = locate_workshop_root(cfg)
     if not official_root:
         print("[wait] 未发现已就绪的 Workshop 目录。")
@@ -1273,6 +1332,8 @@ def main():
     if "--once" in sys.argv:
         cfg = read_conf()
         try:
+            # 单次模式也尝试触发一次（若 WE 已在运行）
+            _maybe_run_custom_we_cmd(cfg, locate_we_exe(cfg))
             run_once(cfg)
         except Exception as e:
             print("[error/once]", e)
@@ -1292,6 +1353,9 @@ def main():
         except Exception:
             run_now_evt = None
 
+    # 启动即尝试触发（若 WE 已在运行）
+    _maybe_run_custom_we_cmd(cfg, locate_we_exe(cfg))
+
     run_on_start = _cfg_bool(cfg, "schedule", "run_on_startup", True)
     interval_s = parse_interval(cfg.get("schedule","interval",fallback=""))
     detect_s = parse_interval(cfg.get("schedule","detect_interval", fallback="5m"))
@@ -1307,6 +1371,8 @@ def main():
 
     if interval_s <= 0:
         while isinstance(status, str) and status.startswith("WAIT_"):
+            # 循环中也持续尝试触发一次（若 WE 已在运行且尚未触发）
+            _maybe_run_custom_we_cmd(cfg, locate_we_exe(cfg))
             _wait_run_now_or_timeout(run_now_evt, detect_s)
             try:
                 status = run_once(cfg)
@@ -1318,6 +1384,8 @@ def main():
 
     while True:
         try:
+            # 定时循环中也持续尝试触发一次（若 WE 已在运行且尚未触发）
+            _maybe_run_custom_we_cmd(cfg, locate_we_exe(cfg))
             sleep_for = detect_s if (isinstance(status, str) and status.startswith("WAIT_")) else interval_s
             _wait_run_now_or_timeout(run_now_evt, sleep_for)
             status = run_once(cfg)
