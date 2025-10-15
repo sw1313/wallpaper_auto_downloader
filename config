@@ -88,6 +88,10 @@ enable=true
 file=we_downloads.log
 
 [we_control]
+# 是否在检测软件启动后检测到we后执行一次wallpaper engine command指令
 enable = false
+# 执行的具体指令，示例为执行一次清除副屏（monitor 1）的壁纸（不会清除播放列表），具体请查看官方介绍：https://help.wallpaperengine.io/en/functionality/cli.html
 cmd = -control closeWallpaper -monitor 1
+# 检测到we后执行指令的延迟
 delay = 1s
+
