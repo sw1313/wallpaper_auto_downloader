@@ -105,6 +105,7 @@ TPM_RETURNCMD   = 0x0100
 IDM_LOGIN           = 1000
 IDM_TOGGLE_CONSOLE  = 1001
 IDM_FORCE_SWITCH    = 1002
+IDM_EXCLUDE_CREATOR = 1005
 IDM_TOGGLE_AUTOSTART= 1003
 IDM_EXIT            = 1004
 
@@ -739,6 +740,21 @@ def _ini_set_key_preserve_comments(path: Path, section: str, key: str, value: st
     with open(path, "w", encoding="utf-8", newline=newline) as f:
         f.write(newline.join(lines) + newline)
 
+def _parse_steamid64_list(s: str) -> list[str]:
+    import re
+    pat = re.compile(r"(?<!\d)(\d{17})(?!\d)")
+    out: list[str] = []
+    seen = set()
+    for token in (s or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        for m in pat.finditer(token):
+            sid = m.group(1)
+            if sid not in seen:
+                seen.add(sid); out.append(sid)
+    return out
+
 # ----------------- 原生 Win32 托盘 APP -----------------
 class Win32TrayApp:
     def __init__(self):
@@ -902,6 +918,7 @@ class Win32TrayApp:
         user32.AppendMenuW(hMenu, MF_STRING, IDM_LOGIN, "登录账号...")
         user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_CONSOLE, "打开/隐藏 控制台")
         user32.AppendMenuW(hMenu, MF_STRING, IDM_FORCE_SWITCH, "立即更换一次")
+        user32.AppendMenuW(hMenu, MF_STRING, IDM_EXCLUDE_CREATOR, "排除当前壁纸上传者并立即切换")
         user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_AUTOSTART, autostart_txt)
         user32.AppendMenuW(hMenu, MF_STRING, IDM_EXIT, "退出")
         pt = wintypes.POINT()
@@ -1359,6 +1376,8 @@ class Win32TrayApp:
                 _pulse_event(self._run_now_evt, duration_s=0.08)
             except Exception:
                 self.console.append("[action] 通知失败：RUN_NOW 事件句柄无效。")
+        elif cmd == IDM_EXCLUDE_CREATOR:
+            threading.Thread(target=self._exclude_current_creator_and_switch, daemon=True).start()
         elif cmd == IDM_TOGGLE_AUTOSTART:
             cur = is_autostart_enabled()
             set_autostart(not cur)
@@ -1366,6 +1385,75 @@ class Win32TrayApp:
             self._modify_icon()  # 仅刷新
         elif cmd == IDM_EXIT:
             self._exit_app()
+
+    def _exclude_current_creator_and_switch(self):
+        """
+        读取 state.last_applied -> 查询该作品详情的 creator(SteamID64) -> 写入 config 的 [filters].creator_exclude_ids
+        然后重启 worker，并触发 RUN_NOW 立即切换。
+        """
+        try:
+            cfg, cfg_path = self._load_cfg_readonly()
+            state_rel = (cfg.get("paths", "state_file", fallback="we_auto_state.json") or "").strip() or "we_auto_state.json"
+            state_path = (SCRIPT_DIR / state_rel).resolve()
+            if not state_path.exists():
+                self._msg_error("排除上传者", f"未找到状态文件：{state_path}")
+                return
+
+            import json
+            state = json.loads(state_path.read_text(encoding="utf-8", errors="ignore") or "{}")
+            wid = state.get("last_applied")
+            try:
+                wid_i = int(wid)
+            except Exception:
+                wid_i = 0
+            if wid_i <= 0:
+                self._msg_error("排除上传者", "当前没有可用的 last_applied（可能尚未成功应用过壁纸）。")
+                return
+
+            # 查 creator（复用 we_auto_fetch 的 API）
+            try:
+                import we_auto_fetch
+                det = we_auto_fetch.fetch_details([wid_i], https_proxy=(cfg.get("network","https_proxy",fallback="") or "").strip())
+                it = det.get(wid_i, {}) if isinstance(det, dict) else {}
+            except Exception as e:
+                self._msg_error("排除上传者", f"获取作品详情失败：{e}")
+                return
+
+            creator = it.get("creator")
+            creator_s = str(creator).strip() if creator is not None else ""
+            if not creator_s or not creator_s.isdigit():
+                self._msg_error("排除上传者", f"未能从作品详情中解析 creator（作品ID={wid_i}）。")
+                return
+
+            title = str(it.get("title") or "").strip().replace("\n", " ")
+            if len(title) > 80:
+                title = title[:77] + "..."
+
+            # 合并写回 creator_exclude_ids（保留注释）
+            exist_raw = (cfg.get("filters", "creator_exclude_ids", fallback="") or "")
+            exist_ids = _parse_steamid64_list(exist_raw)
+            if creator_s not in set(exist_ids):
+                exist_ids.append(creator_s)
+            new_val = ",".join(exist_ids)
+            _ini_set_key_preserve_comments(cfg_path, "filters", "creator_exclude_ids", new_val)
+
+            self.console.append(f"[filters] 已加入上传者排除：{creator_s}（来自作品 {wid_i}）")
+            if title:
+                self.console.append(f"[filters]  - Title: {title}")
+            self.console.append(f"[filters] 已写入配置：{cfg_path}")
+
+            # 让改动立刻生效：重启 worker + 触发 RUN_NOW
+            try:
+                self._restart_worker()
+            except Exception:
+                pass
+            try:
+                _pulse_event(self._run_now_evt, duration_s=0.08)
+            except Exception:
+                self.console.append("[action] 通知失败：RUN_NOW 事件句柄无效。")
+
+        except Exception as e:
+            self.console.append(f"[exclude_creator] 失败：{e}")
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         # 注：已移除 TaskbarCreated 处理，不再重建托盘图标

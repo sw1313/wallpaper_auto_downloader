@@ -19,6 +19,11 @@ we_auto_fetch.py — Steam Workshop -> Wallpaper Engine 自动拉取/筛选/应�
     enable = true
     cmd    = -control closeWallpaper -monitor 1
     delay  = 3s
+
+新增（2026-01-20）：
+- [filters] 支持按“标题包含关键字”与“上传者 SteamID64”剔除候选：
+    title_exclude_contains = xxx, yyy
+    creator_exclude_ids    = 7656119..., https://steamcommunity.com/profiles/7656119...
 """
 
 from __future__ import annotations
@@ -79,6 +84,83 @@ def expand(p: str) -> str:
 
 def parse_csv(s: str) -> List[str]:
     return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+_STEAMID64_RE = re.compile(r"(?<!\d)(\d{17})(?!\d)")
+
+def parse_steamid64_list(s: str) -> List[str]:
+    """
+    支持：
+      - 直接填 SteamID64（17 位数字）
+      - 直接填个人主页 URL，例如 https://steamcommunity.com/profiles/7656...
+    返回：去重保序的 SteamID64 字符串列表。
+    """
+    out: List[str] = []
+    seen = set()
+    for token in parse_csv(s):
+        for m in _STEAMID64_RE.finditer(token):
+            sid = m.group(1)
+            if sid not in seen:
+                seen.add(sid); out.append(sid)
+    return out
+
+def _title_block_substrings(cfg: configparser.ConfigParser) -> List[str]:
+    # 统一用 casefold 做不区分大小写匹配
+    return [x.casefold() for x in parse_csv(cfg.get("filters", "title_exclude_contains", fallback="")) if x]
+
+def _creator_block_ids(cfg: configparser.ConfigParser) -> set[str]:
+    return set(parse_steamid64_list(cfg.get("filters", "creator_exclude_ids", fallback="")))
+
+def filter_ids_meta_only(base_ids: List[int], detail_map: Dict[int, dict],
+                         cfg: configparser.ConfigParser) -> List[int]:
+    """
+    只做“元信息过滤”（标题包含关键字 / 上传者 SteamID64），不做 tags 的 OR-AND 维度过滤。
+    用途：当 [subscribe].ids 手工指定时，仍希望能按标题/上传者剔除。
+    """
+    title_blk = _title_block_substrings(cfg)
+    creator_blk = _creator_block_ids(cfg)
+    if (not title_blk) and (not creator_blk):
+        return list(base_ids)
+
+    removed_title = 0
+    removed_creator = 0
+    ex_title: List[tuple[int, str, str]] = []
+    ex_creator: List[tuple[int, str, str]] = []
+    out: List[int] = []
+    for fid in base_ids:
+        it = detail_map.get(fid, {})
+
+        if title_blk:
+            title = (it.get("title") or "")
+            t_low = str(title).casefold()
+            if t_low and any(sub in t_low for sub in title_blk):
+                removed_title += 1
+                if len(ex_title) < 5:
+                    creator = it.get("creator")
+                    ex_title.append((fid, str(title).strip(), str(creator).strip() if creator is not None else "-"))
+                continue
+
+        if creator_blk:
+            creator = it.get("creator")
+            if creator is not None and (str(creator).strip() in creator_blk):
+                removed_creator += 1
+                if len(ex_creator) < 5:
+                    title = (it.get("title") or "")
+                    ex_creator.append((fid, str(title).strip(), str(creator).strip()))
+                continue
+
+        out.append(fid)
+
+    if removed_title or removed_creator:
+        print(f"[filters/meta] 已剔除：title 命中 {removed_title} 个 / creator 命中 {removed_creator} 个；剩余 {len(out)} 个候选。")
+        for fid, title, creator in ex_title:
+            t = title.replace("\n", " ").strip()
+            if len(t) > 80: t = t[:77] + "..."
+            print(f"[filters/meta]  - title 命中：{fid} | Creator: {creator} | Title: {t}")
+        for fid, title, creator in ex_creator:
+            t = title.replace("\n", " ").strip()
+            if len(t) > 80: t = t[:77] + "..."
+            print(f"[filters/meta]  - creator 命中：{fid} | Creator: {creator} | Title: {t}")
+    return out
 
 def parse_interval(s: str) -> int:
     if not s: return 0
@@ -472,6 +554,11 @@ def _print_filters_summary(cfg: configparser.ConfigParser):
     print("  - Ages:", fmt(dims["ages_norm"]))
     print("  - Resolutions:", fmt_res(dims["res_sets"]))
     print("  - Exclude:", fmt(dims["exclude_norm"]))
+    # 元信息过滤（不参与 tag 维度的 OR-AND，但属于候选剔除条件）
+    title_blk = _title_block_substrings(cfg)
+    creator_blk = _creator_block_ids(cfg)
+    print("  - Title exclude contains:", ", ".join(title_blk) if title_blk else "(未设)")
+    print("  - Creator exclude ids:", ", ".join(sorted(creator_blk)) if creator_blk else "(未设)")
 
 # ---------- 构造“查询用”的原始 include tag 列表（用于 requiredtags） ----------
 def _include_plain_tags_raw_for_queries(cfg: configparser.ConfigParser) -> List[str]:
@@ -781,9 +868,25 @@ def filter_ids_with_details_AND(base_ids: List[int], detail_map: Dict[int, dict]
     need_res   = bool(d["res_sets"])
     exclude    = d["exclude_norm"]
 
+    title_blk = _title_block_substrings(cfg)
+    creator_blk = _creator_block_ids(cfg)
+
     out: List[int] = []
     for fid in base_ids:
         it = detail_map.get(fid, {})
+
+        # ---------- 元信息过滤：title / creator ----------
+        if title_blk:
+            title = (it.get("title") or "")
+            t_low = str(title).casefold()
+            if t_low and any(sub in t_low for sub in title_blk):
+                continue
+        if creator_blk:
+            creator = it.get("creator")
+            if creator is not None:
+                if str(creator).strip() in creator_blk:
+                    continue
+
         tags_norm = {_norm_tag((t.get("tag") or "").strip()) for t in (it.get("tags") or [])}
 
         # exclude
@@ -1032,6 +1135,9 @@ def get_auto_candidates(cfg: configparser.ConfigParser) -> Tuple[List[int], Dict
 
 # ---------- 元信息打印 ----------
 def _print_item_meta(fid: int, it: dict):
+    title = (it.get("title") or "-")
+    creator = it.get("creator")
+    creator_s = str(creator).strip() if creator is not None else "-"
     tps = _extract_type_tags(it)
     age = _extract_age_tag(it) or "-"
     res = _extract_resolution_strings(it)
@@ -1039,7 +1145,11 @@ def _print_item_meta(fid: int, it: dict):
     tps_s = ", ".join(tps) if tps else "-"
     res_s = ", ".join(res[:3]) if res else "-"
     genres_s = ", ".join(genres) if genres else "-"
-    print(f"[meta] {fid} | Type: {tps_s} | Age: {age} | Resolution: {res_s} | Genres: {genres_s}")
+    # title 太长时截断，便于控制台阅读
+    title_s = str(title).replace("\n", " ").strip()
+    if len(title_s) > 80:
+        title_s = title_s[:77] + "..."
+    print(f"[meta] {fid} | Creator: {creator_s} | Title: {title_s} | Type: {tps_s} | Age: {age} | Resolution: {res_s} | Genres: {genres_s}")
 
 # ---------- 主执行 ----------
 def run_once(cfg: configparser.ConfigParser) -> str:
@@ -1072,8 +1182,12 @@ def run_once(cfg: configparser.ConfigParser) -> str:
     else:
         ids_all, det_all = get_auto_candidates(cfg)
 
+    # 元信息过滤：对“手工 ids”也生效（不影响 tags 维度过滤逻辑）
+    if ids_all:
+        ids_all = filter_ids_meta_only(ids_all, det_all, cfg)
+
     if not ids_all:
-        print("[pick] 无候选；请放宽 [filters] 或在 [subscribe] 填 ids。")
+        print("[pick] 无候选；请放宽 [filters] 或在 [subscribe] 填 ids（或检查 title/creator 排除规则是否过严）。")
         return "NO_CANDIDATES"
 
     state_file = HERE / cfg.get("paths","state_file",fallback="we_auto_state.json")
@@ -1364,18 +1478,19 @@ def main():
     status = "INIT"
     if run_on_start:
         try:
-            status = run_once(cfg)
+            status = run_once(read_conf())
         except Exception as e:
             print("[error/startup]", e)
             status = "ERROR"
 
     if interval_s <= 0:
         while isinstance(status, str) and status.startswith("WAIT_"):
+            cfg = read_conf()
             # 循环中也持续尝试触发一次（若 WE 已在运行且尚未触发）
             _maybe_run_custom_we_cmd(cfg, locate_we_exe(cfg))
             _wait_run_now_or_timeout(run_now_evt, detect_s)
             try:
-                status = run_once(cfg)
+                status = run_once(read_conf())
             except KeyboardInterrupt:
                 print("\n[exit] 用户中断"); break
             except Exception as e:
@@ -1384,11 +1499,12 @@ def main():
 
     while True:
         try:
+            cfg = read_conf()
             # 定时循环中也持续尝试触发一次（若 WE 已在运行且尚未触发）
             _maybe_run_custom_we_cmd(cfg, locate_we_exe(cfg))
             sleep_for = detect_s if (isinstance(status, str) and status.startswith("WAIT_")) else interval_s
             _wait_run_now_or_timeout(run_now_evt, sleep_for)
-            status = run_once(cfg)
+            status = run_once(read_conf())
         except KeyboardInterrupt:
             print("\n[exit] 用户中断"); break
         except Exception as e:
