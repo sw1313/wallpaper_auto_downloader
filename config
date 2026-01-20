@@ -47,6 +47,12 @@ resolution=
 tags=
 # 排除的标签（可空）
 exclude=Abstract,Memes
+# 标题包含这些关键字则排除（不区分大小写；逗号分隔）
+# 示例：title_exclude_contains=R18,AI,4K
+title_exclude_contains=vam
+# 排除上传者（创意工坊作者）SteamID64（支持直接填 17 位数字，或填个人主页 URL；逗号分隔）
+# 示例：creator_exclude_ids=12345678901234567 或 creator_exclude_ids=https://steamcommunity.com/profiles/12345678901234567
+creator_exclude_ids=
 # 每次 Web API 拉取的每页数量（优先级高于 [fallback].page_size）
 numperpage=60
 # 过滤后至少要拿到这么多候选（API 模式生效）
@@ -94,5 +100,6 @@ enable = false
 cmd = -control closeWallpaper -monitor 1
 # 检测到we后执行指令的延迟
 delay = 1s
+
 
 
