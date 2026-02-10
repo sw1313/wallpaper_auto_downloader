@@ -1,35 +1,125 @@
-# wallpaper_auto_downloader
-Wallpaper Engine - Wallpaper Scheduled Auto-Switch Application<br/>
-Automatically download Workshop files via steamcmd and let WE app switch wallpapers on a schedule.<br/>
-<br/>
-Since Steam prohibits automated programs from performing headless login, and there is no API for auto-subscribing to Workshop content, the only option is to use steamcmd for downloading, not subscribing.<br/>
-<br/>
-The config requires the following parameters:<br/>
-- api_key (Steam Web API key, obtainable at https://steamcommunity.com/dev/apikey)<br/>
-- interval (scheduling period: e.g. 3h / 90m / 1h30m; leave empty to execute only once)<br/>
-- filters (set according to your needs; to avoid malicious content, it is recommended to only use Scene and Video for types)<br/>
-- we_exe (path to the Wallpaper Engine executable; in Steam: right-click → Manage → Browse local files)<br/>
-- workshop_root (path where WE app wallpapers are stored; it is recommended not to use the official Workshop path to avoid deleting subscribed wallpapers when wallpapers are removed)<br/>
-- steamcmd (path to steamcmd, must be downloaded first: https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip)<br/>
-- steam_username (Steam account that owns Wallpaper Engine, required for login)<br/>
-<br/>
-Before using, extract steamcmd into a folder, and set the path to steamcmd.exe in the config. Then, in the tray icon menu, choose to log in to the account and follow the process.<br/>
-<br/>
-After starting the program, a tray icon will appear. Right-click to set whether the app runs at startup, or to switch wallpapers immediately. Left-click opens the console (to check if login and wallpaper download work properly). It is recommended not to switch wallpapers too frequently, as this may trigger Steam’s anti-bot mechanisms.<br/>
-<br/>
-Due to steamcmd being a standalone Steam login, the Steam client may require re-login after logging in, and during the program download process, Wallpaper Engine may not be able to subscribe properly.<br/>
-<br/>
-Wallpaper Engine - 壁纸定时自动切换应用程序<br/>
-通过steamcmd自动下载创意工坊文件并让we应用来定时切换壁纸<br/>
-因为steam禁止自动化程序进行无头登录，且也没有自动订阅创意工坊的api，所以只能依靠steamcmd下载，不能订阅<br/>
-config需要输入参数:<br/>
-api_key（steam的web api_key，在https://steamcommunity.com/dev/apikey 获取）<br/>
-interval（定时周期：如 3h / 90m / 1h30m；留空则只执行一次）<br/>
-filters内参数请自行判断所需内容，为了防止赛博花柳病，types建议只填入Scene, Video<br/>
-we_exe（wallpaper engine的程序路径，在steam中右键，-管理-浏览本地文件查看）<br/>
-workshop_root（让we应用的壁纸留存的路径，建议不使用官方的workshop路径，防止壁纸删除的时候删掉创意工坊订阅的壁纸）<br/>
-steamcmd（steamcmd 路径,需要先下载steamcmd：https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip ）<br/>
-steam_username：（需要登录的购买了wallpaper engine的账号）<br/>
-使用之前，先解压steamcmd放入某个文件夹，config里填入该steamcmd.exe所在路径。然后在托盘图标菜单选择登录账号，然后按流程操作
-程序启动后，会在应用托盘显示一个图标，右键可以设置应用是否开机自启，立即更换壁纸，左键为查看控制台（可以排查是否正常登录和下载了壁纸），建议不要更换壁纸太过频繁，可能触发steam反爬机制<br/>
-由于steamcmd是独立的steam登录，登录账号后steam客户端可能需要重新登录，程序下载过程中wallpaper engine内可能无法正常订阅
+# WEAutoTray（Wallpaper Engine 创意工坊自动换壁纸）
+
+这是一个常驻托盘的小工具：按你的筛选条件从 Steam Workshop 拉取 Wallpaper Engine（AppID `431960`）作品，下载到本地后自动应用，并按配置清理历史下载。
+
+当前工作目录示例：`D:\we`
+
+## 功能概览
+
+- 托盘常驻 + 实时控制台
+- 自动抓取候选（优先走 Steam Web API；无 Key 时回退网页抓取）
+- 维度过滤（**维度内 OR、维度间 AND**）：Genre/Type/Age/Resolution + exclude
+- 支持按 **标题关键字** 与 **上传者 SteamID64** 排除
+- SteamCMD 下载 → 镜像到 `workshop_root` → 同步到 WE `projects/backup` → 发送 WE 控制指令应用
+- one-per-run 模式：每轮只应用 1 个，循环切换
+- 清理历史：可配置删除上一张（或保留最近 N 张）
+
+## 目录结构（重要文件）
+
+- `WEAutoTray.exe`：主程序（托盘）
+- `we_tray.py`：托盘源码入口
+- `we_auto_fetch.py`：候选抓取/下载/应用逻辑（worker）
+- `config`：配置文件（ini 格式）
+- `WEAutoTray.spec`：PyInstaller 打包配置
+- `we_auto_state.json`：状态/历史（自动生成）
+- `we_downloads.log`：下载/应用记录（可选）
+
+## 快速开始
+
+### 1) 准备依赖
+
+需要：
+- Wallpaper Engine 已安装
+- SteamCMD 可用
+
+### 2) 配置 `config`
+
+打开 `D:\we\config`，最少确保这些路径正确：
+
+- `[paths].we_exe`：例如 `F:\SteamLibrary\steamapps\common\wallpaper_engine\wallpaper64.exe`
+- `[paths].steamcmd`：例如 `D:\steamcmd\steamcmd.exe`
+- `[paths].workshop_root`：例如 `D:\WE_script_workshop`
+
+账号（建议至少填用户名）：
+
+- `[auth].steam_username`
+- `steam_password/steam_guard_code` 建议只用于首次登录，成功后清空，使用已缓存凭证
+
+### 3) 运行
+
+双击 `WEAutoTray.exe`，托盘出现图标即表示运行中。
+
+## 托盘菜单说明
+
+右键托盘图标：
+
+- **登录账号...**：用弹窗输入账号/密码/2FA（成功后会重启 worker）
+- **打开/隐藏 控制台**：查看实时日志
+- **立即更换一次**：触发 worker 立刻执行一轮
+- **排除当前壁纸上传者并立即切换**：把当前作品作者加入 `[filters].creator_exclude_ids` 后立刻切换
+- **开启/关闭开机自启**
+- **退出**
+
+## 配置说明（按当前 `config`）
+
+### 调度
+
+- `[schedule].run_on_startup=true`：启动就跑一轮
+- `[schedule].interval=2h`：每 2 小时执行一轮（留空/0 表示只跑一次）
+- `[schedule].detect_interval=1m`：等待路径就绪时的检测间隔
+
+### 候选来源与排序
+
+- `[steam].api_key=...`：可选；有 Key 时走 Web API（更稳定）
+- `[sort].method=Most Popular (Week)`：支持 `Top Rated / Most Popular(...) / Most Recent / Most Subscriptions / Most Up Votes`
+
+### 过滤（核心）
+
+`[filters]` 采用：**维度内 OR、维度间 AND**。
+
+- `tags=Anime`：标签维度
+- `types=Video`：类型维度（Scene/Video/Web/Application/Wallpaper/Preset）
+- `age=G`：年龄分级（G/PG13/R → Everyone/Questionable/Mature）
+- `resolution=`：可留空；例如 `3840 x 2160`
+- `exclude=...`：排除标签（命中即剔除）
+- `title_exclude_contains=vam`：标题包含关键字则剔除（不区分大小写）
+- `creator_exclude_ids=7656...`：排除上传者 SteamID64（可填 17 位数字或 profiles URL）
+- `min_candidates=100`：API 模式下，AND 过滤后达到最少候选才早停
+
+### 清理
+
+- `[cleanup].delete_previous=true`：应用新壁纸后清理旧项（会清 3 处目录）
+- `[cleanup].keep_last_n=0`：>0 时改为保留最近 N 张（不会只删上一张）
+- `[cleanup].use_recycle_bin=false`：true 时移动到 `Trash/`，false 直接删
+
+## 常见问题
+
+### 1) 为什么日志里会重复打印 `[config]` / `[filters]`？
+
+程序会多次读取配置以支持热更新；新版本已做“配置未变化不重复打印摘要”，刷屏会明显减少。
+
+### 2) SteamCMD 报 `Locking Failed` / `steam didn't shutdown cleanly`
+
+一般是 SteamCMD 残留/并发导致锁冲突。新版本在重启 worker 时会尽量结束进程树，并对可重试错误做退避重试。
+
+建议：
+- 确保任务管理器里没有残留 `steamcmd.exe`
+- 避免在下载过程中频繁“登录/重启 worker”
+
+### 3) 应用壁纸失败（返回码 5）
+
+`wallpaper64.exe -control ...` 返回码 5 常见于 **权限级别不一致**：
+- Wallpaper Engine 与 WEAutoTray 需要同为“管理员”或同为“非管理员”运行。
+
+## 重新打包（开发者）
+
+在 `D:\we` 下使用 PyInstaller：
+
+```powershell
+py -m pip install -U pyinstaller requests
+py -m PyInstaller --noconfirm --clean WEAutoTray.spec
+```
+
+输出在：
+- `dist\WEAutoTray.exe`
+
