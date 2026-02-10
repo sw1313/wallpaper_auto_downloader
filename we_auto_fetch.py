@@ -35,6 +35,23 @@ from typing import Dict, List, Optional, Tuple
 APPID_WE = 431960
 
 # =========================
+# 输出编码（Windows 兼容）
+# =========================
+def _force_utf8_stdio() -> None:
+    """
+    修复 Windows 默认 cp936/gbk 下，遇到标题/文本含 emoji 时 print() 触发 UnicodeEncodeError，
+    进而导致主循环 [error/loop]、定时更换“看似失效”。
+    """
+    if os.name != "nt":
+        return
+    for s in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        try:
+            if s and hasattr(s, "reconfigure"):
+                s.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
+# =========================
 # 配置与路径解析
 # =========================
 def _app_root() -> Path:
@@ -67,16 +84,47 @@ def _candidate_config_paths() -> list[Path]:
     return uniq
 
 def read_conf() -> configparser.ConfigParser:
+    """
+    读取配置文件。
+    说明：本程序在一次轮询/一次 run 内可能会多次读取配置（为支持热更新），
+    因此这里默认做“若配置文件未变化则不重复打印摘要”，避免控制台刷屏。
+    """
     candidates = _candidate_config_paths()
     for p in candidates:
         if p.exists():
             cfg = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",))
             cfg.read(p, encoding="utf-8")
-            print(f"[config] 使用配置：{p}")
-            _print_filters_summary(cfg)
+            _maybe_print_config_summary(p, cfg)
             return cfg
     tried = "\n  - " + "\n  - ".join(str(p) for p in candidates)
     raise RuntimeError("未找到配置文件；已尝试：" + tried)
+
+
+# =========================
+# 配置摘要去重打印（避免刷屏）
+# =========================
+_LAST_CONF_SIG: tuple[str, int, int] | None = None  # (path, mtime_ns, size)
+
+
+def _maybe_print_config_summary(p: Path, cfg: configparser.ConfigParser) -> None:
+    """
+    若配置文件路径/mtime/大小发生变化，则打印一次摘要；否则跳过。
+    """
+    global _LAST_CONF_SIG
+    try:
+        st = p.stat()
+        sig = (str(p), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size))
+    except Exception:
+        # 无法 stat 时退化：每次都打印（但这种情况很少见）
+        sig = None
+
+    if sig is not None and _LAST_CONF_SIG == sig:
+        return
+
+    print(f"[config] 使用配置：{p}")
+    _print_filters_summary(cfg)
+    if sig is not None:
+        _LAST_CONF_SIG = sig
 
 # ---------- 小工具 ----------
 def expand(p: str) -> str:
@@ -944,50 +992,104 @@ def _print_progress_line(line: str) -> None:
     print(line.rstrip())
 
 def steamcmd_download_batch(exe: Path, uid: str, pwd: Optional[str], guard: Optional[str],
-                            ids: List[int]) -> Tuple[bool, str]:
-    if not ids: return True, "no-op"
-    args: List[str] = []
-    if guard: args += ["+set_steam_guard_code", guard]
-    if pwd:   args += ["+login", uid, pwd]
-    else:     args += ["+login", uid]
-    for wid in ids:
-        print(f"[task] 下载条目：{wid}  https://steamcommunity.com/sharedfiles/filedetails/?id={wid}")
-        args += ["+workshop_download_item", str(APPID_WE), str(wid), "validate"]
-    args += ["+quit"]
-    print("[steamcmd]", " ".join(args))
-    proc = subprocess.Popen(
-        [str(exe), *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,
-        universal_newlines=True,
-        encoding="utf-8",
-        errors="ignore",
-        **_win_hidden_popen_kwargs()
+                            ids: List[int],
+                            retries: int = 2,
+                            retry_delay_s: float = 4.0) -> Tuple[bool, str]:
+    """
+    调用 steamcmd 下载 Workshop 项目。
+    说明：
+      - steamcmd 有时会出现 `Locking Failed` / `steam didn't shutdown cleanly` / `No Connection` 这类短暂错误，
+        直接重试通常可恢复；因此这里做了有限次数的退避重试。
+    """
+    if not ids:
+        return True, "no-op"
+
+    # 可重试关键字（尽量只覆盖“明显瞬态/并发锁”）
+    retryable_kw = (
+        "Locking Failed",
+        "steam didn't shutdown cleanly",
+        "scheduling immediate update check",
+        "No Connection",
+        "Update canceled: Shutdown (No connection)",
+        "Waiting for client config...Failed",
     )
-    all_out = io.StringIO()
-    try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            all_out.write(line)
-            _print_progress_line(line)
-    finally:
-        proc.wait(timeout=3600)
-    out_s = all_out.getvalue()
-    ok_markers = (
-        "Logged in",
-        "Loading Steam API...OK",
-        "Connecting anonymously to Steam Public",
-        "Success. Downloaded item",
-        "Success. App '431960'",
-        "workshop_download_item <AppID>",
-    )
-    ok = (proc.returncode == 0) and any(m in out_s for m in ok_markers)
-    if not ok:
+
+    last_out = ""
+    for attempt in range(1, max(0, int(retries)) + 2):
+        args: List[str] = []
+        if guard:
+            args += ["+set_steam_guard_code", guard]
+        if pwd:
+            args += ["+login", uid, pwd]
+        else:
+            args += ["+login", uid]
+        for wid in ids:
+            print(f"[task] 下载条目：{wid}  https://steamcommunity.com/sharedfiles/filedetails/?id={wid}")
+            args += ["+workshop_download_item", str(APPID_WE), str(wid), "validate"]
+        args += ["+quit"]
+
+        if attempt == 1:
+            print("[steamcmd]", " ".join(args))
+        else:
+            print(f"[steamcmd/retry] 第 {attempt-1} 次重试：", " ".join(args))
+
+        proc = subprocess.Popen(
+            [str(exe), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="ignore",
+            **_win_hidden_popen_kwargs()
+        )
+        all_out = io.StringIO()
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                all_out.write(line)
+                _print_progress_line(line)
+        finally:
+            proc.wait(timeout=3600)
+        out_s = all_out.getvalue()
+        last_out = out_s
+
+        # 判断成功：以“下载成功”作为强信号（比 returncode 更可靠）
+        ok = (proc.returncode == 0) and ("Success. Downloaded item" in out_s)
+        if ok:
+            return True, out_s
+
         print(f"[error] steamcmd 退出码：{proc.returncode}")
         tail = "\n".join(out_s.splitlines()[-20:])
         print("[error] tail:\n" + tail)
-    return ok, out_s
+
+        # 不再重试
+        if attempt >= (max(0, int(retries)) + 1):
+            break
+
+        # 仅在命中“可重试关键字”时才重试，避免对真正失败无限纠缠
+        if not any(k in out_s for k in retryable_kw):
+            break
+
+        time.sleep(max(0.5, float(retry_delay_s)) * attempt)
+
+    return False, last_out
+
+
+def _wait_dir_has_files(p: Path, timeout_s: float = 15.0, poll_s: float = 0.25) -> bool:
+    """
+    某些情况下 steamcmd 退出后内容目录会稍晚才完整落盘/提交。
+    这里给一个短暂等待窗口，避免误判 “未找到下载目录”。
+    """
+    t0 = time.time()
+    while time.time() - t0 < max(0.0, float(timeout_s)):
+        try:
+            if p.exists() and any(p.rglob("*")):
+                return True
+        except Exception:
+            pass
+        time.sleep(max(0.05, float(poll_s)))
+    return False
 
 def mirror_dir(src: Path, dst: Path) -> bool:
     dst.mkdir(parents=True, exist_ok=True)
@@ -1044,20 +1146,37 @@ def apply_in_we(entry: Path, we_exe: Path, retries: int = 2, delay_s: float = 1.
             print(f"[apply] 调用：{Path(we_exe).name} -control openWallpaper -file \"{entry}\""
                   + (f" -monitor {monitor}" if monitor is not None else ""))
 
-            p = subprocess.Popen(cmd, **_win_hidden_popen_kwargs())
+            # 捕获输出：便于诊断返回码（例如 rc=5 常见于权限/管理员级别不一致导致控制失败）
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **_win_hidden_popen_kwargs())
             try:
-                rc = p.wait(timeout=send_timeout_s)
-                if rc == 0:
-                    print("[apply] 已将壁纸指令发送给 Wallpaper Engine。")
-                    return
-                else:
-                    # 返回非零也可能不致命，重试一次
-                    print(f"[apply] 命令进程返回码 {rc}，将重试（尝试 {attempt}/{retries}）。")
-                    last_err = subprocess.CalledProcessError(rc, cmd)
+                out_b = (p.communicate(timeout=send_timeout_s)[0] or b"")
             except subprocess.TimeoutExpired:
                 # 主进程常驻，发送器没退出并不代表失败，这里直接认为已发送
                 print("[apply] 已发送指令（发送器未在超时时间内退出，继续）。")
                 return
+
+            rc = int(p.returncode or 0)
+            if rc == 0:
+                print("[apply] 已将壁纸指令发送给 Wallpaper Engine。")
+                return
+
+            msg = ""
+            if out_b:
+                try:
+                    msg = out_b.decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    try:
+                        msg = out_b.decode("mbcs", errors="ignore").strip()
+                    except Exception:
+                        msg = ""
+            if msg:
+                print("[apply] 输出：\n" + msg)
+
+            if rc == 5:
+                print("[apply] 提示：返回码 5 常见于“权限/管理员级别不一致”。请确保 Wallpaper Engine 与 WEAutoTray 运行权限一致（都非管理员，或都以管理员运行）。")
+            # 返回非零也可能不致命，重试一次
+            print(f"[apply] 命令进程返回码 {rc}，将重试（尝试 {attempt}/{retries}）。")
+            last_err = subprocess.CalledProcessError(rc, cmd)
 
         except Exception as e:
             last_err = e
@@ -1266,7 +1385,7 @@ def run_once(cfg: configparser.ConfigParser) -> str:
             raise RuntimeError("steamcmd 登录或下载失败")
 
         src = base_tmp_root / str(wid)
-        if not src.exists() or not any(src.rglob("*")):
+        if not _wait_dir_has_files(src, timeout_s=18.0, poll_s=0.25):
             print(f"[skip] 未找到下载目录：{src}，尝试下一个...")
             state.setdefault("failed_recent", []).append(wid)
             continue
@@ -1443,6 +1562,7 @@ def _wait_run_now_or_timeout(h, timeout_s: float) -> bool:
 
 # ---------- 入口 ----------
 def main():
+    _force_utf8_stdio()
     if "--once" in sys.argv:
         cfg = read_conf()
         try:
