@@ -35,7 +35,13 @@ STEAMCMD_LOGIN_TIMEOUT_S = 45.0
 MOBILE_CONFIRM_MAX_WAIT_S = 60.0
 MOBILE_GAP_DETECT_S = 6.0
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+def _app_dir() -> Path:
+    # 单文件 PyInstaller 下，__file__ 在临时 _MEIPASS；我们需要用 EXE 所在目录来找 config。
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+SCRIPT_DIR = _app_dir()
 WORKER_SCRIPT_ABS = (SCRIPT_DIR / WORKER_SCRIPT).resolve()
 
 user32   = ctypes.windll.user32
@@ -579,6 +585,9 @@ def start_worker_and_reader(console: ConsoleWindow, job_handle: int | None = Non
         stderr=subprocess.STDOUT,
         bufsize=1,
         universal_newlines=True,
+        # worker 已强制 stdout/stderr 为 UTF-8；这里也必须按 UTF-8 解码，否则会出现中文乱码，甚至读线程异常退出导致“后续无日志”
+        encoding="utf-8",
+        errors="replace",
         close_fds=True,
         cwd=str(SCRIPT_DIR),
         **_win_hidden_popen_kwargs()
@@ -601,16 +610,41 @@ def start_worker_and_reader(console: ConsoleWindow, job_handle: int | None = Non
     t.start()
     return WorkerProc(proc=p, reader_thread=t)
 
+# ----------------- 进程树强制结束（Windows） -----------------
+def _taskkill_tree(pid: int) -> None:
+    """
+    强制结束 PID 及其子进程树。
+    目的：在重启 worker / 登录切换时，避免遗留 steamcmd.exe 子进程继续占用 workshop 锁文件，
+    导致后续出现 `Download item ... failed (Locking Failed)`.
+    """
+    if os.name != "nt" or not pid:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            capture_output=True,
+            check=False,
+            **_win_hidden_popen_kwargs()
+        )
+    except Exception:
+        pass
+
 def stop_worker(wp: WorkerProc, timeout=5.0):
     if not wp or not wp.proc: return
     try:
+        # 先尝试温和结束；若卡住则强制杀整个进程树（避免遗留 steamcmd 子进程占锁）
         wp.proc.terminate()
         try:
             wp.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            wp.proc.kill()
-            try: wp.proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired: pass
+            try:
+                _taskkill_tree(wp.proc.pid)
+            except Exception:
+                pass
+            try:
+                wp.proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
     except Exception:
         pass
     try:
@@ -652,6 +686,15 @@ def run_worker_inline():
     sys.stderr = _SafeStream(sys.stderr)
     try: sys.stdout.reconfigure(line_buffering=True)
     except Exception: pass
+    # 避免 Windows 默认 gbk/cp936 下输出含 emoji 的标题时崩溃
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+    except Exception:
+        pass
     _start_worker_exit_watcher_thread()
     base = Path(sys.argv[0]).resolve().parent
     sys.path.insert(0, str(base))
@@ -1335,6 +1378,11 @@ class Win32TrayApp:
                     time.sleep(0.05)
         except Exception: pass
         if self.wp and self.wp.proc and self.wp.proc.poll() is None:
+            # 兜底：强制杀整个进程树，避免 steamcmd 残留导致下次下载 Locking Failed
+            try:
+                _taskkill_tree(self.wp.proc.pid)
+            except Exception:
+                pass
             stop_worker(self.wp, timeout=2.0)
 
     def _exit_app(self):
