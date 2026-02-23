@@ -158,21 +158,52 @@ def _title_block_substrings(cfg: configparser.ConfigParser) -> List[str]:
 def _creator_block_ids(cfg: configparser.ConfigParser) -> set[str]:
     return set(parse_steamid64_list(cfg.get("filters", "creator_exclude_ids", fallback="")))
 
+def _resolution_exclude_substrings(cfg: configparser.ConfigParser) -> List[str]:
+    """
+    用于排除“分辨率/比例/方向”相关的 tag/KV 文本，例如：
+      - Portrait（竖屏）
+      - Landscape（横屏）
+      - Ultrawide（超宽）
+    """
+    return [x.casefold() for x in parse_csv(cfg.get("filters", "resolution_exclude_contains", fallback="")) if x]
+
+def _item_hits_resolution_exclude(item: dict, res_blk: List[str]) -> bool:
+    if not res_blk:
+        return False
+    try:
+        kv = _kv_lookup(item)
+        kv_val = (kv.get("resolution", "") or "").strip()
+    except Exception:
+        kv_val = ""
+    if kv_val:
+        low = str(kv_val).casefold()
+        if any(sub in low for sub in res_blk):
+            return True
+    for t in (item.get("tags") or []):
+        s = (t.get("tag") or "")
+        low = str(s).casefold()
+        if any(sub in low for sub in res_blk):
+            return True
+    return False
+
 def filter_ids_meta_only(base_ids: List[int], detail_map: Dict[int, dict],
                          cfg: configparser.ConfigParser) -> List[int]:
     """
-    只做“元信息过滤”（标题包含关键字 / 上传者 SteamID64），不做 tags 的 OR-AND 维度过滤。
+    只做“元信息过滤”（标题包含关键字 / 上传者 SteamID64 / 分辨率关键字排除），不做 tags 的 OR-AND 维度过滤。
     用途：当 [subscribe].ids 手工指定时，仍希望能按标题/上传者剔除。
     """
     title_blk = _title_block_substrings(cfg)
     creator_blk = _creator_block_ids(cfg)
-    if (not title_blk) and (not creator_blk):
+    res_blk = _resolution_exclude_substrings(cfg)
+    if (not title_blk) and (not creator_blk) and (not res_blk):
         return list(base_ids)
 
     removed_title = 0
     removed_creator = 0
+    removed_res = 0
     ex_title: List[tuple[int, str, str]] = []
     ex_creator: List[tuple[int, str, str]] = []
+    ex_res: List[tuple[int, str, str]] = []
     out: List[int] = []
     for fid in base_ids:
         it = detail_map.get(fid, {})
@@ -196,10 +227,18 @@ def filter_ids_meta_only(base_ids: List[int], detail_map: Dict[int, dict],
                     ex_creator.append((fid, str(title).strip(), str(creator).strip()))
                 continue
 
+        if res_blk and _item_hits_resolution_exclude(it, res_blk):
+            removed_res += 1
+            if len(ex_res) < 5:
+                title = (it.get("title") or "")
+                creator = it.get("creator")
+                ex_res.append((fid, str(title).strip(), str(creator).strip() if creator is not None else "-"))
+            continue
+
         out.append(fid)
 
-    if removed_title or removed_creator:
-        print(f"[filters/meta] 已剔除：title 命中 {removed_title} 个 / creator 命中 {removed_creator} 个；剩余 {len(out)} 个候选。")
+    if removed_title or removed_creator or removed_res:
+        print(f"[filters/meta] 已剔除：title 命中 {removed_title} 个 / creator 命中 {removed_creator} 个 / resolution 命中 {removed_res} 个；剩余 {len(out)} 个候选。")
         for fid, title, creator in ex_title:
             t = title.replace("\n", " ").strip()
             if len(t) > 80: t = t[:77] + "..."
@@ -208,6 +247,10 @@ def filter_ids_meta_only(base_ids: List[int], detail_map: Dict[int, dict],
             t = title.replace("\n", " ").strip()
             if len(t) > 80: t = t[:77] + "..."
             print(f"[filters/meta]  - creator 命中：{fid} | Creator: {creator} | Title: {t}")
+        for fid, title, creator in ex_res:
+            t = title.replace("\n", " ").strip()
+            if len(t) > 80: t = t[:77] + "..."
+            print(f"[filters/meta]  - resolution 命中：{fid} | Creator: {creator} | Title: {t}")
     return out
 
 def parse_interval(s: str) -> int:
@@ -605,8 +648,10 @@ def _print_filters_summary(cfg: configparser.ConfigParser):
     # 元信息过滤（不参与 tag 维度的 OR-AND，但属于候选剔除条件）
     title_blk = _title_block_substrings(cfg)
     creator_blk = _creator_block_ids(cfg)
+    res_blk = _resolution_exclude_substrings(cfg)
     print("  - Title exclude contains:", ", ".join(title_blk) if title_blk else "(未设)")
     print("  - Creator exclude ids:", ", ".join(sorted(creator_blk)) if creator_blk else "(未设)")
+    print("  - Resolution exclude contains:", ", ".join(res_blk) if res_blk else "(未设)")
 
 # ---------- 构造“查询用”的原始 include tag 列表（用于 requiredtags） ----------
 def _include_plain_tags_raw_for_queries(cfg: configparser.ConfigParser) -> List[str]:
@@ -878,11 +923,19 @@ def _extract_resolution_strings(item: dict) -> List[str]:
     kv = _kv_lookup(item)
     kv_val = (kv.get("resolution","") or "").strip()
     if kv_val:
-        res += _normalize_resolution_variants(kv_val)
+        # 兼容：KV 里可能是 "Portrait 1080 x 1920" 之类
+        m = re.search(r"(\d+)\s*(?:x|×)\s*(\d+)", kv_val.replace("X", "x"))
+        if m:
+            res += _normalize_resolution_variants(f"{m.group(1)} x {m.group(2)}")
+        else:
+            res += _normalize_resolution_variants(kv_val)
     for t in (item.get("tags") or []):
         s = (t.get("tag") or "").strip()
-        if re.match(r"^\d+\s*(?:x|×)\s*\d+$", s.replace("X","x")):
-            res += _normalize_resolution_variants(s)
+        # 兼容："Portrait 1080 x 1920" / "Ultrawide 3440 x 1440" 等
+        s2 = s.replace("X", "x")
+        m = re.search(r"(\d+)\s*(?:x|×)\s*(\d+)", s2)
+        if m:
+            res += _normalize_resolution_variants(f"{m.group(1)} x {m.group(2)}")
     # 去重
     normed = set()
     out = []
@@ -894,11 +947,15 @@ def _extract_resolution_strings(item: dict) -> List[str]:
 
 def _extract_genres(item: dict) -> List[str]:
     builtin = {"everyone","questionable","mature",
-               "video","scene","web","application","wallpaper","preset"}
+               "video","scene","web","application","wallpaper","preset",
+               # 方向/比例/分辨率相关：不当作“风格标签”
+               "portrait","landscape","ultrawide"}
     out = []
     for t in (item.get("tags") or []):
         s = (t.get("tag") or "").strip()
-        if _norm_tag(s) not in builtin and not re.match(r"^\d+\s*(?:x|×)\s*\d+$", s.replace("X","x")):
+        # 排除：纯分辨率与“带前缀”的分辨率标签（例如 Portrait 1080 x 1920）
+        has_res = bool(re.search(r"(\d+)\s*(?:x|×)\s*(\d+)", s.replace("X", "x")))
+        if _norm_tag(s) not in builtin and (not has_res):
             out.append(s)
     seen, uniq = set(), []
     for x in out:
@@ -918,6 +975,7 @@ def filter_ids_with_details_AND(base_ids: List[int], detail_map: Dict[int, dict]
 
     title_blk = _title_block_substrings(cfg)
     creator_blk = _creator_block_ids(cfg)
+    res_blk = _resolution_exclude_substrings(cfg)
 
     out: List[int] = []
     for fid in base_ids:
@@ -934,6 +992,9 @@ def filter_ids_with_details_AND(base_ids: List[int], detail_map: Dict[int, dict]
             if creator is not None:
                 if str(creator).strip() in creator_blk:
                     continue
+        # ---------- 分辨率/比例关键字排除（如 Portrait） ----------
+        if res_blk and _item_hits_resolution_exclude(it, res_blk):
+            continue
 
         tags_norm = {_norm_tag((t.get("tag") or "").strip()) for t in (it.get("tags") or [])}
 
@@ -963,7 +1024,12 @@ def filter_ids_with_details_AND(base_ids: List[int], detail_map: Dict[int, dict]
                 kv = _kv_lookup(it)
                 kv_val = (kv.get("resolution","") or "").strip()
                 if kv_val:
-                    kv_norms = {_norm_tag(x) for x in _normalize_resolution_variants(kv_val)}
+                    # 兼容：KV 里是 "Portrait 1080 x 1920" 之类
+                    m = re.search(r"(\d+)\s*(?:x|×)\s*(\d+)", kv_val.replace("X", "x"))
+                    if m:
+                        kv_norms = {_norm_tag(x) for x in _normalize_resolution_variants(f"{m.group(1)} x {m.group(2)}")}
+                    else:
+                        kv_norms = {_norm_tag(x) for x in _normalize_resolution_variants(kv_val)}
                     if any(s & kv_norms for s in d["res_sets"]):
                         res_ok = True
             if not res_ok:
