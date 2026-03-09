@@ -5,7 +5,7 @@ we_auto_fetch.py — Steam Workshop -> Wallpaper Engine 自动拉取/筛选/应�
 本版要点（2025-10-01）：
 - [filters] 的 show_only / types / age / resolution / tags：**维度内 OR、维度间 AND**；
   exclude 则在合集中再减去（同时传给服务端 excludedtags[] 预过滤）。
-- 服务端抓取 = “单 tag 分次抓取并集”，本地再做“维度 AND”过滤；达到 min_candidates 才早停。
+- 服务端抓取 = “多维度 tag 笛卡尔积组合查询”（match_all_tags），服务端直接做 AND；本地再做安全校验。
 - 分辨率兼容多写法（1280x720 / 1280 × 720 / 1280 x 720），tag 或 KV 都能匹配。
 - RUN_NOW 命名事件（配合托盘“立即更换一次”）、--once 单次执行模式。
 - 控制台会输出：各维度配置、抓取分页摘要、应用时该条目的 Type/Age/Resolution/Genres 等元信息。
@@ -653,40 +653,73 @@ def _print_filters_summary(cfg: configparser.ConfigParser):
     print("  - Creator exclude ids:", ", ".join(sorted(creator_blk)) if creator_blk else "(未设)")
     print("  - Resolution exclude contains:", ", ".join(res_blk) if res_blk else "(未设)")
 
-# ---------- 构造“查询用”的原始 include tag 列表（用于 requiredtags） ----------
-def _include_plain_tags_raw_for_queries(cfg: configparser.ConfigParser) -> List[str]:
-    inc: List[str] = []
-    # 原始 show_only + tags（保持用户的写法，含空格大小写）
-    inc += parse_csv(cfg.get("filters","show_only",fallback=""))
-    inc += parse_csv(cfg.get("filters","tags",fallback=""))
-    # types 映射为标准可见 tag（首字母大写）
+# ---------- 构造"查询用"的 tag 组合（让服务端做 AND） ----------
+def _build_query_tag_combos(cfg: configparser.ConfigParser) -> List[List[str]]:
+    """
+    构造服务端 requiredtags 组合：各维度各取一个 tag，做笛卡尔积。
+    服务端用 match_all_tags=True 一次返回同时满足所有 tag 的结果，
+    维度内 OR 通过"多组合查询 -> 并集"实现。
+
+    例如 age=PG13, types=Video/Scene, tags=MMD/Anime 生成 4 个组合：
+      ['Questionable', 'Video', 'MMD']
+      ['Questionable', 'Video', 'Anime']
+      ['Questionable', 'Scene', 'MMD']
+      ['Questionable', 'Scene', 'Anime']
+    """
+    import itertools
+
+    groups: List[List[str]] = []
+
+    # age
+    ages_in = [x.strip().upper() for x in parse_csv(cfg.get("filters","age",fallback=""))]
+    age_tags = [_AGE_CANON_TO_TAG[a] for a in ages_in if a in _AGE_CANON_TO_TAG]
+    if age_tags:
+        groups.append(age_tags)
+
+    # types
     types_in = [t.strip().lower() for t in parse_csv(cfg.get("filters","types",fallback=""))]
+    type_tags: List[str] = []
     for t in types_in:
         if t in _TYPE_CANON_TO_TAG:
-            inc.append(_TYPE_CANON_TO_TAG[t])
+            type_tags.append(_TYPE_CANON_TO_TAG[t])
         else:
             hit = False
             for canon, aliases in _TYPE_ALIASES.items():
                 if t == canon or t in aliases:
-                    inc.append(_TYPE_CANON_TO_TAG.get(canon, t.title())); hit = True; break
+                    type_tags.append(_TYPE_CANON_TO_TAG.get(canon, t.title())); hit = True; break
             if not hit:
-                inc.append(t.title())
-    # age
-    ages_in = [x.strip().upper() for x in parse_csv(cfg.get("filters","age",fallback=""))]
-    inc += [_AGE_CANON_TO_TAG[a] for a in ages_in if a in _AGE_CANON_TO_TAG]
-    # 去重保序
-    seen, uniq = set(), []
-    for x in inc:
-        if x and x not in seen:
-            uniq.append(x); seen.add(x)
-    return uniq
+                type_tags.append(t.title())
+    if type_tags:
+        groups.append(type_tags)
 
-# ---------- WebAPI：按单 tag 抓取并集 ----------
+    # resolution
+    res_tags: List[str] = []
+    for r in parse_csv(cfg.get("filters","resolution",fallback="")):
+        vars = _normalize_resolution_variants(r)
+        if vars:
+            res_tags.append(vars[0])
+    if res_tags:
+        groups.append(res_tags)
+
+    # genre（show_only + tags）
+    genre_tags = parse_csv(cfg.get("filters","show_only",fallback="")) + parse_csv(cfg.get("filters","tags",fallback=""))
+    genre_tags = [x for x in genre_tags if x]
+    if genre_tags:
+        groups.append(genre_tags)
+
+    if not groups:
+        return [[]]
+
+    MAX_COMBOS = 30
+    combos = list(itertools.islice(itertools.product(*groups), MAX_COMBOS))
+    return [list(c) for c in combos]
+
+# ---------- WebAPI ----------
 def _make_session_for_cfg(cfg):
     return _make_session(cfg.get("network","https_proxy",fallback="").strip())
 
-def _query_webapi_single_tag(sess, key: str, qtype: int, days: int, npp: int,
-                             req_tag: Optional[str], exc_tags: List[str], cursor: str) -> Tuple[Dict, str]:
+def _query_webapi(sess, key: str, qtype: int, days: int, npp: int,
+                  req_tags: List[str], exc_tags: List[str], cursor: str) -> Tuple[Dict, str]:
     base_url = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
     payload = {
         "query_type": qtype, "appid": APPID_WE, "numperpage": npp,
@@ -699,8 +732,8 @@ def _query_webapi_single_tag(sess, key: str, qtype: int, days: int, npp: int,
     if qtype == 3 and days:
         payload["days"] = days
         payload["include_recent_votes_only"] = False
-    if req_tag:
-        payload["requiredtags"] = [req_tag]
+    if req_tags:
+        payload["requiredtags"] = req_tags
     if exc_tags:
         payload["excludedtags"] = exc_tags
     if cursor:
@@ -729,29 +762,23 @@ def query_files_webapi_union_AND(cfg: configparser.ConfigParser) -> Tuple[List[i
     max_pages = max(pages, _cfg_int(cfg, "fallback", "max_pages", pages))
     min_cands = _cfg_int(cfg, "filters", "min_candidates", 0)
 
-    dims = _build_dimensions(cfg)
-    include_plain = _include_plain_tags_raw_for_queries(cfg)
-    # resolution：使用 'W x H'
-    res_req_tags = []
-    for r in parse_csv(cfg.get("filters","resolution",fallback="")):
-        vars = _normalize_resolution_variants(r)
-        if vars:
-            res_req_tags.append(vars[0])
     exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
-
-    tags_to_query: List[Optional[str]] = [*include_plain, *res_req_tags] if (include_plain or res_req_tags) else [None]
+    tag_combos = _build_query_tag_combos(cfg)
 
     ids: List[int] = []
     det: Dict[int, dict] = {}
     seen_ids = set()
     dbg_logs: List[str] = []
 
-    for tag in tags_to_query:
+    dbg_logs.append(f"[api] combos={tag_combos}")
+
+    for combo in tag_combos:
         cursor = "*"
+        combo_label = "+".join(combo) if combo else "<none>"
         for p in range(1, max_pages+1):
-            resp, cursor = _query_webapi_single_tag(sess, key, qtype, days, page_size, tag, exc_tags, cursor)
+            resp, cursor = _query_webapi(sess, key, qtype, days, page_size, combo, exc_tags, cursor)
             items = resp.get("publishedfiledetails") or resp.get("files") or resp.get("items") or []
-            dbg_logs.append(f"[api] tag={tag or '<none>'} p{p} items={len(items)}")
+            dbg_logs.append(f"[api] tags=[{combo_label}] p{p} items={len(items)}")
             if not items:
                 break
             for it in items:
@@ -760,12 +787,10 @@ def query_files_webapi_union_AND(cfg: configparser.ConfigParser) -> Tuple[List[i
                 seen_ids.add(fid); ids.append(fid)
                 if fid not in det: det[fid] = it
 
-            # 仅当“维度 AND”过滤后数量达到 min_candidates 才早停
-            if min_cands > 0:
-                cur = filter_ids_with_details_AND(ids, det, cfg)
-                if len(cur) >= min_cands:
-                    dbg_logs.append(f"[api] early-stop: reached min_candidates={min_cands} with AND filter")
-                    return cur, {i: det[i] for i in cur}, " | ".join(dbg_logs)
+            if min_cands > 0 and len(ids) >= min_cands:
+                dbg_logs.append(f"[api] early-stop: reached min_candidates={min_cands}")
+                filtered = filter_ids_with_details_AND(ids, det, cfg)
+                return filtered, {i: det[i] for i in filtered}, " | ".join(dbg_logs)
 
             if (not cursor) or (len(items) < page_size):
                 break
@@ -776,29 +801,23 @@ def query_files_webapi_union_AND(cfg: configparser.ConfigParser) -> Tuple[List[i
 # ---------- HTML 回退（并集抓取 + 维度 AND 过滤） ----------
 def map_sort_html(sort_name: str) -> Tuple[str,int]:
     s = (sort_name or "").lower()
-    # Top Rated
     if s in ("top rated", "most up votes", "most upvoted", "top-rated"):
         return "vote", 0
-    # Most Popular (Day/Week/Month/Year)
     if s.startswith("most popular"):
         if "year" in s:  return "trend", 365
         if "month" in s: return "trend", 30
         if "week" in s:  return "trend", 7
         if "day" in s or "today" in s: return "trend", 1
-        return "trend", 7  # 默认周榜
-    # Most Recent
+        return "trend", 7
     if s in ("most recent", "newest", "recent"):
         return "mostrecent", 0
-    # Last updated
     if s in ("last updated", "recently updated", "updated"):
         return "lastupdated", 0
-    # Most Subscriptions / Most Subscribed
     if s in ("most subscriptions", "most subscribed", "subscriptions", "subscribed"):
         return "totaluniquesubscribers", 0
-    # fallback
     return "trend", 7
 
-def _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, page, req_tag, exc_tags) -> List[int]:
+def _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, page, req_tags, exc_tags) -> List[int]:
     headers = {"Referer": f"{base_url}?appid={APPID_WE}&browsesort={comm_sort}"}
     params = {
         "appid": str(APPID_WE),
@@ -810,8 +829,8 @@ def _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, page, r
         "p": str(page),
         "actualsort": comm_sort,
     }
-    if req_tag:
-        params["requiredtags[]"] = [req_tag]
+    if req_tags:
+        params["requiredtags[]"] = req_tags
     if exc_tags:
         params["excludedtags[]"] = exc_tags
     try:
@@ -840,30 +859,25 @@ def community_ids_html_union(cfg: configparser.ConfigParser) -> List[int]:
     sess = _make_session_for_cfg(cfg)
     base_url = "https://steamcommunity.com/workshop/browse/"
 
-    include_plain = _include_plain_tags_raw_for_queries(cfg)
-    # resolution tags for server
-    res_req_tags = []
-    for r in parse_csv(cfg.get("filters","resolution",fallback="")):
-        vars = _normalize_resolution_variants(r)
-        if vars:
-            res_req_tags.append(vars[0])
     exc_tags = parse_csv(cfg.get("filters","exclude",fallback=""))
-
-    tags_to_query: List[Optional[str]] = [*include_plain, *res_req_tags] if (include_plain or res_req_tags) else [None]
+    tag_combos = _build_query_tag_combos(cfg)
 
     ids, seen = [], set()
-    for tag in tags_to_query:
+    print(f"[html] combos={tag_combos}")
+    for combo in tag_combos:
+        combo_label = "+".join(combo) if combo else "<none>"
         for p in range(1, max_pages+1):
-            part = _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, p, tag, exc_tags)
-            print(f"[html] tag={tag or '<none>'} p{p} items={len(part)}")
+            part = _html_fetch_ids_once(sess, base_url, comm_sort, comm_days, per_page, p, combo, exc_tags)
+            print(f"[html] tags=[{combo_label}] p{p} items={len(part)}")
             for fid in part:
                 if fid not in seen:
                     seen.add(fid); ids.append(fid)
-            if min_cands > 0 and len(ids) >= min_cands:  # 粗略早停，最终还会本地 AND 过滤
+            if min_cands > 0 and len(ids) >= min_cands:
                 return ids
             if len(part) < per_page:
                 break
     return ids
+
 
 # ---------- 详情获取 ----------
 def fetch_details(ids: List[int], https_proxy: str="") -> Dict[int, dict]:
