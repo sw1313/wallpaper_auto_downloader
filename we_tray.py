@@ -11,10 +11,12 @@ we_tray.py（Win32 托盘 · 登录完善最终版 r16）
 - PyInstaller 单文件：优先加载 EXE 内嵌图标，其次 MEIPASS/同目录
 - 隐藏 steamcmd 窗口（CREATE_NO_WINDOW + 兜底按 PID 隐藏顶层窗）
 
-r16 变更（彻底移除“TaskbarCreated 重建”）：
-- [移除] 不再注册/处理 TaskbarCreated 广播，不再在任务栏重启时重建托盘图标。
-- [保持] 仅启动时执行 NIM_ADD，电源/会话消息仅执行 NIM_MODIFY（刷新），不会触发重建。
-- [保持] NIM_SETVERSION 失败不影响 added 状态。
+r17 变更（修复托盘菜单消失）：
+- [修复] 右键菜单：兼容 VERSION_0 和 VERSION_4 消息格式（WM_RBUTTONUP + WM_CONTEXTMENU）。
+- [修复] SetForegroundWindow：AttachThreadInput 保证菜单获取前台焦点。
+- [修复] 重入保护：_menu_showing 防止模态循环期间重入。
+- [恢复] TaskbarCreated 广播：explorer 重启后自动恢复托盘图标。
+- [改进] 电源恢复/会话解锁：改为 NIM_ADD 重建而非仅 NIM_MODIFY。
 """
 
 from __future__ import annotations
@@ -90,6 +92,9 @@ WM_APP_LOGIN          = WM_USER + 100
 WM_LBUTTONUP     = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP     = 0x0205
+WM_RBUTTONDOWN   = 0x0204
+NIN_SELECT       = 0x0400
+NIN_KEYSELECT    = 0x0401
 
 # 托盘
 NIM_ADD       = 0x00000000
@@ -107,6 +112,7 @@ NOTIFYICON_VERSION_4 = 4
 MF_STRING = 0x0000
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD   = 0x0100
+TPM_NONOTIFY    = 0x0080
 
 IDM_LOGIN           = 1000
 IDM_TOGGLE_CONSOLE  = 1001
@@ -223,6 +229,15 @@ kernel32.GetModuleHandleW.restype  = HINSTANCE
 
 wtsapi32.WTSRegisterSessionNotification.argtypes   = [HWND, wintypes.DWORD]
 wtsapi32.WTSUnRegisterSessionNotification.argtypes = [HWND]
+
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype  = wintypes.UINT
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype  = wintypes.BOOL
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype  = HWND
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype  = wintypes.DWORD
 
 # ---- 枚举/隐藏窗口（兜底用）----
 user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
@@ -864,7 +879,7 @@ class Win32TrayApp:
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd
         nid.uID = 0
-        nid.uFlags = 0
+        nid.uFlags = NIF_GUID
         nid.guidItem = self.tray_guid
         nid.uTimeoutOrVersion = NOTIFYICON_VERSION_4
         return nid
@@ -955,23 +970,50 @@ class Win32TrayApp:
         self.added = False
 
     # ---------- 右键菜单 ----------
+    _menu_showing = False
+
     def _show_context_menu(self):
-        hMenu = user32.CreatePopupMenu()
-        autostart_txt = "关闭开机自启" if is_autostart_enabled() else "开启开机自启"
-        user32.AppendMenuW(hMenu, MF_STRING, IDM_LOGIN, "登录账号...")
-        user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_CONSOLE, "打开/隐藏 控制台")
-        user32.AppendMenuW(hMenu, MF_STRING, IDM_FORCE_SWITCH, "立即更换一次")
-        user32.AppendMenuW(hMenu, MF_STRING, IDM_EXCLUDE_CREATOR, "排除当前壁纸上传者并立即切换")
-        user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_AUTOSTART, autostart_txt)
-        user32.AppendMenuW(hMenu, MF_STRING, IDM_EXIT, "退出")
-        pt = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
+        if self._menu_showing:
+            return
+        self._menu_showing = True
+        try:
+            hMenu = user32.CreatePopupMenu()
+            autostart_txt = "关闭开机自启" if is_autostart_enabled() else "开启开机自启"
+            user32.AppendMenuW(hMenu, MF_STRING, IDM_LOGIN, "登录账号...")
+            user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_CONSOLE, "打开/隐藏 控制台")
+            user32.AppendMenuW(hMenu, MF_STRING, IDM_FORCE_SWITCH, "立即更换一次")
+            user32.AppendMenuW(hMenu, MF_STRING, IDM_EXCLUDE_CREATOR, "排除当前壁纸上传者并立即切换")
+            user32.AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_AUTOSTART, autostart_txt)
+            user32.AppendMenuW(hMenu, MF_STRING, IDM_EXIT, "退出")
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            self._force_foreground()
+            cmd = user32.TrackPopupMenu(
+                hMenu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                pt.x, pt.y, 0, self.hwnd, None,
+            )
+            user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
+            if cmd:
+                user32.PostMessageW(self.hwnd, WM_COMMAND, cmd, 0)
+            user32.DestroyMenu(hMenu)
+        finally:
+            self._menu_showing = False
+
+    def _force_foreground(self):
+        try:
+            fg = user32.GetForegroundWindow()
+            if fg:
+                fg_tid = user32.GetWindowThreadProcessId(fg, None)
+                my_tid = kernel32.GetCurrentThreadId()
+                if fg_tid != my_tid:
+                    user32.AttachThreadInput(fg_tid, my_tid, True)
+                    user32.SetForegroundWindow(self.hwnd)
+                    user32.AttachThreadInput(fg_tid, my_tid, False)
+                    return
+        except Exception:
+            pass
         user32.SetForegroundWindow(self.hwnd)
-        cmd = user32.TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, self.hwnd, None)
-        user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
-        if cmd:
-            user32.PostMessageW(self.hwnd, WM_COMMAND, cmd, 0)
-        user32.DestroyMenu(hMenu)
 
     # ---------- 简易 MsgBox（仅报错） ----------
     def _msgbox(self, title: str, text: str, flags: int) -> int:
@@ -1504,23 +1546,32 @@ class Win32TrayApp:
             self.console.append(f"[exclude_creator] 失败：{e}")
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
-        # 注：已移除 TaskbarCreated 处理，不再重建托盘图标
+        # TaskbarCreated：explorer 重启后恢复托盘图标
+        if hasattr(self, "_WM_TASKBAR_CREATED") and msg == self._WM_TASKBAR_CREATED:
+            self.console.append("[tray] 检测到任务栏重建（explorer 重启），正在恢复托盘图标…")
+            self.added = False
+            self._add_icon()
+            return 0
 
         if msg == WM_TRAYICON:
-            sub = int(lparam) & 0xFFFFFFFF
-            if sub in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+            sub = int(lparam) & 0xFFFF
+            if sub in (WM_LBUTTONUP, WM_LBUTTONDBLCLK, NIN_SELECT, NIN_KEYSELECT):
                 self.console.toggle(); return 0
-            if sub == WM_RBUTTONUP:
+            if sub in (WM_RBUTTONUP, WM_CONTEXTMENU):
                 self._show_context_menu(); return 0
             return 0
 
         if msg == WM_POWERBROADCAST and wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
-            self.console.append("[tray] 电源恢复，刷新托盘（不重建）。")
-            self._modify_icon(); return 1
+            self.console.append("[tray] 电源恢复，刷新托盘。")
+            self.added = False
+            self._add_icon()
+            return 1
 
         if msg == WM_WTSSESSION_CHANGE and wparam in (WTS_SESSION_UNLOCK, WTS_SESSION_LOGON):
-            self.console.append("[tray] 会话解锁/登录，刷新托盘（不重建）。")
-            self._modify_icon(); return 0
+            self.console.append("[tray] 会话解锁/登录，刷新托盘。")
+            self.added = False
+            self._add_icon()
+            return 0
 
         if msg == WM_COMMAND:
             self._on_cmd(wparam & 0xFFFF); return 0
@@ -1569,7 +1620,11 @@ class Win32TrayApp:
         try: wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
         except Exception: pass
 
-        # 仅启动时添加一次托盘图标
+        try:
+            self._WM_TASKBAR_CREATED = user32.RegisterWindowMessageW("TaskbarCreated")
+        except Exception:
+            self._WM_TASKBAR_CREATED = 0
+
         self._add_icon()
 
         msg = wintypes.MSG()
