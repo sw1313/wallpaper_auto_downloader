@@ -931,10 +931,13 @@ class Win32TrayApp:
         self.console.append("[tray] 未找到自定义图标，使用系统默认图标。")
         return user32.LoadIconW(None, MAKEINTRESOURCE(IDI_APPLICATION))
 
+    _tray_v4 = False
+
     def _set_tray_version(self):
         nid_ver = self._build_nid_for_setver()
         ok_ver = self._notify(NIM_SETVERSION, nid_ver)
-        self.console.append(f"[tray] 设定托盘协议版本：{'成功' if ok_ver else '失败（忽略）'}。")
+        self._tray_v4 = bool(ok_ver)
+        self.console.append(f"[tray] 设定托盘协议版本：{'V4' if ok_ver else '失败，回退V0'}。")
         return ok_ver
 
     def _add_icon(self):
@@ -968,6 +971,16 @@ class Win32TrayApp:
         except Exception:
             pass
         self.added = False
+
+    # ---------- 左键切换控制台（带防抖） ----------
+    _last_toggle_ts = 0.0
+
+    def _toggle_debounced(self):
+        now = time.monotonic()
+        if now - self._last_toggle_ts < 0.35:
+            return
+        self._last_toggle_ts = now
+        self.console.toggle()
 
     # ---------- 右键菜单 ----------
     _menu_showing = False
@@ -1555,10 +1568,16 @@ class Win32TrayApp:
 
         if msg == WM_TRAYICON:
             sub = int(lparam) & 0xFFFF
-            if sub in (WM_LBUTTONUP, WM_LBUTTONDBLCLK, NIN_SELECT, NIN_KEYSELECT):
-                self.console.toggle(); return 0
-            if sub in (WM_RBUTTONUP, WM_CONTEXTMENU):
-                self._show_context_menu(); return 0
+            if self._tray_v4:
+                if sub in (NIN_SELECT, NIN_KEYSELECT):
+                    self._toggle_debounced(); return 0
+                if sub == WM_CONTEXTMENU:
+                    self._show_context_menu(); return 0
+            else:
+                if sub in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                    self._toggle_debounced(); return 0
+                if sub == WM_RBUTTONUP:
+                    self._show_context_menu(); return 0
             return 0
 
         if msg == WM_POWERBROADCAST and wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
